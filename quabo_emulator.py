@@ -7,11 +7,12 @@ import datetime
 import argparse
 
 class QuaboEmulatorProtocol(asyncio.DatagramProtocol):
-    def __init__(self, quabo_id, means, variances, delay=0.1):
+    def __init__(self, quabo_id, means, variances, delay=0.1, drop_prob=0.0):
         self.quabo_id = quabo_id
         self.means = means
         self.stds = [v**0.5 for v in variances]
         self.delay = delay
+        self.drop_prob = drop_prob
         self.transport = None
 
     def connection_made(self, transport):
@@ -20,6 +21,11 @@ class QuaboEmulatorProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
         recv_time = datetime.datetime.now().strftime('%H:%M:%S.%f')
         if not data:
+            return
+
+        # Simulate packet drop
+        if random.random() < self.drop_prob:
+            print(f"[{recv_time}] Quabo {self.quabo_id}: Dropped command from {addr} (prob={self.drop_prob})")
             return
 
         cmd = data[0]
@@ -46,17 +52,17 @@ class QuaboEmulatorProtocol(asyncio.DatagramProtocol):
         pixel_data = struct.pack('<256h', *pixels)
         self.transport.sendto(header + pixel_data, addr)
 
-async def run_emulator(quabo_id, port, delay):
+async def run_emulator(quabo_id, port, delay, drop_prob):
     # Initialize 256 channels with random mean (0-10) and variance (10-20)
     means = [random.uniform(0, 10) for _ in range(256)]
     variances = [random.uniform(10, 20) for _ in range(256)]
     
     loop = asyncio.get_event_loop()
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: QuaboEmulatorProtocol(quabo_id, means, variances, delay),
+        lambda: QuaboEmulatorProtocol(quabo_id, means, variances, delay, drop_prob),
         local_addr=('127.0.0.1', port)
     )
-    print(f"Quabo {quabo_id} emulator listening on 127.0.0.1:{port} (delay={delay}s)")
+    print(f"Quabo {quabo_id} emulator listening on 127.0.0.1:{port} (delay={delay}s, drop_prob={drop_prob})")
     
     try:
         while True:
@@ -64,12 +70,7 @@ async def run_emulator(quabo_id, port, delay):
     finally:
         transport.close()
 
-async def main():
-    parser = argparse.ArgumentParser(description='PANOSETI Quabo Emulator')
-    parser.add_argument('--delay', type=float, default=0.001, help='Response delay in seconds')
-    parser.add_argument('--disable', type=int, nargs='*', default=[], help='List of quabo IDs (0-3) to disable')
-    args = parser.parse_args()
-
+async def main(args):
     # Start 4 emulators for ports 60000 to 60003
     tasks = []
     disabled_ids = set(args.disable)
@@ -77,21 +78,41 @@ async def main():
         if i in disabled_ids:
             print(f"Quabo {i} is DISABLED.")
             continue
-        tasks.append(run_emulator(i, 60000 + i, args.delay))
+        tasks.append(run_emulator(i, 60000 + i, args.delay, args.drop_prob))
     
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='PANOSETI Quabo Emulator')
+    parser.add_argument('--delay', type=float, default=0.001, help='Response delay in seconds')
+    parser.add_argument('--disable', type=int, nargs='*', default=[], help='List of quabo IDs (0-3) to disable')
+    parser.add_argument('--drop-prob', type=float, default=0.0, help='Probability of dropping a packet (0.0 to 1.0)')
+    args = parser.parse_args()
+
     if hasattr(asyncio, 'run'):
         try:
-            asyncio.run(main())
+            asyncio.run(main(args))
         except KeyboardInterrupt:
             print("\nShutting down emulator...")
     else:
         loop = asyncio.get_event_loop()
+        main_task = asyncio.ensure_future(main(args))
         try:
-            loop.run_until_complete(main())
+            loop.run_until_complete(main_task)
         except KeyboardInterrupt:
             print("\nShutting down emulator...")
+            # Cancel all tasks
+            main_task.cancel()
+            # Run the loop until all tasks are cancelled
+            if hasattr(asyncio, 'all_tasks'):
+                pending = asyncio.all_tasks(loop=loop)
+            else:
+                pending = asyncio.Task.all_tasks(loop=loop)
+            
+            for task in pending:
+                task.cancel()
+            # Allow tasks to finish cancellation
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         finally:
             loop.close()

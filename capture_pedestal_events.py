@@ -17,6 +17,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger('capture_pedestals')
 
+def get_loop():
+    """Compatibility helper to get the event loop."""
+    try:
+        return asyncio.get_running_loop()
+    except AttributeError:
+        # Python < 3.7
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        # No loop running
+        return asyncio.get_event_loop()
+
 def calculate_ip_checksum(header):
     """Calculates the 16-bit one's complement sum of the IPv4 header."""
     if len(header) % 2 == 1:
@@ -79,7 +90,7 @@ SITES = {
         'base_ip': '127.0.0.1',
         'daq_ip': '127.0.0.1',
         'module_id': 0,
-        'scope': 'localhost',
+        'scope': 'Emulator',
         'use_ports': True
     }
 }
@@ -89,22 +100,21 @@ class PcapngWriter:
     def __init__(self, filename):
         self.filename = filename
         self.file = open(filename, 'wb')
+        self.packets_written = 0
         self._write_shb()
         self._write_idb()
         self.file.flush()
-        logger.debug(f"PcapngWriter initialized: {filename}")
 
     def _write_shb(self):
         # Section Header Block (SHB)
-        # We'll add 'shb_os' and 'shb_userappl' options to look professional
         os_str = "Linux".encode('utf-8')
         os_pad = (4 - (len(os_str) % 4)) % 4
         appl_str = "PANOSETI Pedestal Capture".encode('utf-8')
         appl_pad = (4 - (len(appl_str) % 4)) % 4
         
-        # Options: shb_os (12), shb_userappl (4), opt_endofopt (0)
+        # Options: shb_os (3), shb_userappl (4), opt_endofopt (0)
         options = (
-            struct.pack('<HH', 12, len(os_str)) + os_str + b'\x00' * os_pad +
+            struct.pack('<HH', 3, len(os_str)) + os_str + b'\x00' * os_pad +
             struct.pack('<HH', 4, len(appl_str)) + appl_str + b'\x00' * appl_pad +
             struct.pack('<HH', 0, 0)
         )
@@ -116,17 +126,12 @@ class PcapngWriter:
 
     def _write_idb(self):
         # Interface Description Block (IDB)
-        # To get nanoseconds, we add the if_tsresol option (0x09)
-        # LinkType 1 = Ethernet.
+        # LinkType 1 = Ethernet. Value 9 for if_tsresol means 10^-9 (nanoseconds).
         idb_body = struct.pack('<HHI', 1, 0, 65535)
-        
-        # Option 9: if_tsresol (1 byte). Value 9 means 10^-9 (nanoseconds).
-        # Must pad to 4 bytes.
         options = (
             struct.pack('<HHB', 9, 1, 9) + b'\x00' * 3 +
             struct.pack('<HH', 0, 0)
         )
-        
         idb_len = 20 + len(options)
         idb_block = struct.pack('<II', 0x00000001, idb_len) + idb_body + options + struct.pack('<I', idb_len)
         self.file.write(idb_block)
@@ -154,11 +159,11 @@ class PcapngWriter:
             blocks.append(data)
             blocks.append(b'\x00' * padding_len)
             blocks.append(struct.pack('<I', epb_len))
+            self.packets_written += 1
         
         if blocks:
             self.file.write(b''.join(blocks))
             self.file.flush()
-            logger.debug(f"Wrote batch of {len(packet_batch)} packets to {self.filename}")
 
     def close(self):
         if self.file:
@@ -187,13 +192,6 @@ def create_ethernet_ip_udp_packet(payload, src_ip, dst_ip, src_port, dst_port):
     
     return eth_hdr + ip_hdr + udp_hdr + payload
 
-class QuaboProtocol(asyncio.DatagramProtocol):
-    def __init__(self, future):
-        self.future = future
-    def datagram_received(self, data, addr):
-        if not self.future.done():
-            self.future.set_result(data)
-
 class QuaboManager(asyncio.DatagramProtocol):
     """Manages a single persistent UDP socket for all quabos."""
     def __init__(self):
@@ -211,7 +209,7 @@ class QuaboManager(asyncio.DatagramProtocol):
 
     async def trigger_quabo(self, ip, port, timeout=0.5):
         """Sends a trigger to a specific quabo and waits for the response."""
-        loop = asyncio.get_event_loop()
+        loop = get_loop()
         future = loop.create_future()
         addr = (ip, port)
         
@@ -228,16 +226,12 @@ class QuaboManager(asyncio.DatagramProtocol):
         try:
             self.transport.sendto(cmd, addr)
         except OSError as e:
-            logger.error(f"Failed to send to {addr}: {e}")
             self.pending_requests.pop(addr, None)
             return None
         
         try:
-            data = await asyncio.wait_for(future, timeout=timeout)
-            logger.debug(f"Received {len(data)} bytes from {addr}")
-            return data
+            return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            logger.debug(f"Timeout waiting for response from {addr} (timeout={timeout}s)")
             self.pending_requests.pop(addr, None)
             return None
 
@@ -247,17 +241,23 @@ class QuaboClient:
         self.ip = ip
         self.port = port
         self.quadrant = quadrant
-        self.missing_count = 0
+        self.total_missing = 0
         self.consecutive_misses = 0
         self.is_down = False
+        # Stats for per-minute reporting
+        self.misses_since_last_report = 0
 
 class PedestalGenerator:
     def __init__(self, args):
         self.args = args
         self.site_info = SITES[args.site]
+        self.scope = self.site_info['scope']
         self.quabos = self._init_quabos()
         self._validate_quabos()
+        
         self.total_generated = 0
+        self.generated_since_last_report = 0
+        
         self.cycle_count = 0
         self.pcap_writer = None
         self.last_rollover_sec = 0
@@ -265,6 +265,10 @@ class PedestalGenerator:
         self.manager = None
         self.transport = None
         self.local_buffer = []
+
+    def log(self, level, msg):
+        """Custom logging helper that adds telescope scope to every message."""
+        getattr(logger, level.lower())(f"[{self.scope}] {msg}")
 
     def _init_quabos(self):
         clients = []
@@ -290,19 +294,21 @@ class PedestalGenerator:
 
     async def _flush_buffer_to_disk(self):
         """Offloads the current local buffer to the PcapngWriter in the executor."""
-        if not self.local_buffer or not self.pcap_writer:
+        batch = self.local_buffer
+        writer = self.pcap_writer
+        
+        if not batch or not writer:
             return
         
-        batch = self.local_buffer
         self.local_buffer = []
-        logger.debug(f"Flushing {len(batch)} packets to disk executor...")
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self.pcap_writer.write_batch, batch)
+        self.log("debug", f"Flushing {len(batch)} packets to disk executor...")
+        loop = get_loop()
+        await loop.run_in_executor(self.executor, writer.write_batch, batch)
 
     async def _write_pcap_async(self, packet, ts_sec, ts_nano):
         # Buffer on the main loop to truly reduce thread context switching
         self.local_buffer.append((packet, ts_sec, ts_nano))
-        logger.debug(f"Added packet to local buffer (size={len(self.local_buffer)})")
+        self.log("debug", f"Added packet to local buffer (size={len(self.local_buffer)})")
         if len(self.local_buffer) >= self.args.buffer:
             await self._flush_buffer_to_disk()
 
@@ -311,40 +317,56 @@ class PedestalGenerator:
         if self.pcap_writer is None or ts_utc - self.last_rollover_sec >= self.args.rollover:
             if self.pcap_writer:
                 await self._flush_buffer_to_disk()
-                # Close in the executor to avoid blocking
-                loop = asyncio.get_event_loop()
+                filename = self.pcap_writer.filename
+                # Close in the executor and wait for it
+                loop = get_loop()
                 await loop.run_in_executor(self.executor, self.pcap_writer.close)
+                self.log("info", f"Closing {filename}, {self.pcap_writer.packets_written} packets written to file.")
             
             dt = datetime.datetime.fromtimestamp(ts_utc)
             filename = self.args.output.format(
-                scope=self.site_info['scope'], date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
+                scope=self.scope, date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
             )
-            logger.info(f"Rolling over to {filename}")
+            self.log("info", f"Opening {filename}")
             self.pcap_writer = PcapngWriter(filename)
             self.last_rollover_sec = ts_utc
 
     async def watchdog_task(self):
         while True:
-            await asyncio.sleep(180)
-            missing = [q.missing_count for q in self.quabos]
-            logger.info(f"Status: Total={self.total_generated}, Missing={missing}")
-            # Flush current buffer to disk every 3 mins for persistence
-            await self._flush_buffer_to_disk()
+            await asyncio.sleep(60) # 1 minute
+            
+            miss_reports = []
+            for i, q in enumerate(self.quabos):
+                if q.misses_since_last_report > 0:
+                    miss_reports.append(f"Q{i}: {q.misses_since_last_report}")
+            
+            if not miss_reports:
+                miss_str = "no missed packets"
+            else:
+                miss_str = f"missing packets - {', '.join(miss_reports)}"
+                
+            stats_msg = f"Last 60s: {self.generated_since_last_report} pedestals generated, {miss_str}"
+            self.log("info", stats_msg)
+            
+            # Reset delta stats
+            self.generated_since_last_report = 0
+            for q in self.quabos:
+                q.misses_since_last_report = 0
 
     async def run(self):
-        loop = asyncio.get_event_loop()
+        loop = get_loop()
         # Initialize the single shared socket
         self.transport, self.manager = await loop.create_datagram_endpoint(
             lambda: QuaboManager(),
             local_addr=('0.0.0.0', self.args.bind_port)
         )
         local_addr = self.transport.get_extra_info('sockname')
-        logger.info(f"Starting pedestal capture for {self.site_info['scope']} at {self.args.frequency} Hz")
-        logger.info(f"Bound to local UDP port {local_addr[1]} (buffer={self.args.buffer})")
+        self.log("info", f"Starting pedestal capture at {self.args.frequency} Hz")
+        self.log("info", f"Bound to local UDP port {local_addr[1]} (buffer={self.args.buffer})")
         
-        watchdog = asyncio.ensure_future(self.watchdog_task())
+        asyncio.ensure_future(self.watchdog_task())
         
-        # Anchor the schedule to a start of second to ensure triggers happen at .500
+        # Anchor the schedule to a start of second
         epoch = int(time.time())
         now = time.time()
         slot = 0
@@ -357,13 +379,13 @@ class PedestalGenerator:
         try:
             while True:
                 trigger_time = epoch + (slot + 0.5) / self.args.frequency
-                logger.debug(f"Starting cycle {slot}, target trigger time: {trigger_time:.3f}")
+                self.log("debug", f"Starting cycle {slot}, target trigger time: {trigger_time:.3f}")
                 sleep_dur = trigger_time - time.time()
                 
                 if sleep_dur > 0:
                     await asyncio.sleep(sleep_dur)
                 elif sleep_dur < -0.1:
-                    logger.warning(f"Cycle {slot} is late by {-sleep_dur:.3f}s")
+                    self.log("warning", f"Cycle {slot} is late by {-sleep_dur:.3f}s")
                 
                 ts_utc = trigger_time
                 ts_tai = int(ts_utc) + self.args.tai_offset
@@ -371,7 +393,7 @@ class PedestalGenerator:
                 slot_within_second = slot % self.args.frequency
                 nanosec = int((slot_within_second + 0.5) / self.args.frequency * 1_000_000_000)
 
-                # Use explicit timeout if provided, otherwise default to 0.5 * period
+                # Timeout default 0.5 * period
                 timeout = self.args.timeout if self.args.timeout is not None else 0.5 / self.args.frequency
 
                 tasks = [self.manager.trigger_quabo(q.ip, q.port, timeout=timeout) for q in self.quabos]
@@ -383,15 +405,15 @@ class PedestalGenerator:
                 for idx, data in enumerate(results):
                     q = self.quabos[idx]
                     if isinstance(data, Exception):
-                        logger.debug(f"Quabo {idx} error: {data}")
+                        self.log("debug", f"Quabo {idx} error: {data}")
                         data = None
 
                     if data and len(data) >= 516:
                         responses_this_cycle += 1
-                        logger.debug(f"Quabo {idx} responded ({len(data)} bytes)")
+                        self.log("debug", f"Quabo {idx} responded ({len(data)} bytes)")
                         
                         if q.is_down:
-                            logger.info(f"Quabo {idx} at {q.ip} has recovered.")
+                            self.log("info", f"Quabo {idx} at {q.ip} has recovered.")
                             q.is_down = False
                         q.consecutive_misses = 0
                         
@@ -406,27 +428,32 @@ class PedestalGenerator:
                         )
                         await self._write_pcap_async(full_packet, int(ts_utc), nanosec)
                         self.total_generated += 1
+                        self.generated_since_last_report += 1
                     else:
-                        q.missing_count += 1
+                        self.log("debug", f"Quabo {idx} timeout waiting for response")
+                        q.total_missing += 1
+                        q.misses_since_last_report += 1
                         q.consecutive_misses += 1
                         if q.consecutive_misses >= 5 and not q.is_down:
-                            logger.warning(f"Quabo {idx} at {q.ip} is not responding (5 consecutive misses). It might be down.")
+                            self.log("warning", f"Quabo {idx} at {q.ip} is not responding (5 consecutive misses). It might be down.")
                             q.is_down = True
                 
                 if responses_this_cycle > 0 and self.total_generated <= 4:
-                    logger.info(f"Received first {responses_this_cycle} responses from quabos.")
+                    self.log("info", f"Received first {responses_this_cycle} responses from quabos.")
                 
                 self.cycle_count += 1
                 slot += 1
         finally:
-            watchdog.cancel()
             if self.pcap_writer:
                 try:
                     await asyncio.shield(self._flush_buffer_to_disk())
-                    loop = asyncio.get_event_loop()
+                    filename = self.pcap_writer.filename
+                    count = self.pcap_writer.packets_written
+                    loop = get_loop()
                     await asyncio.shield(loop.run_in_executor(self.executor, self.pcap_writer.close))
+                    self.log("info", f"Closing {filename}, {count} packets written to file.")
                 except Exception as e:
-                    logger.error(f"Error during final flush: {e}")
+                    self.log("error", f"Error during final flush: {e}")
             if self.transport:
                 self.transport.close()
             self.executor.shutdown()
@@ -439,12 +466,11 @@ async def main():
     parser.add_argument('--output', '-o', default='pedestals_{scope}_{date}_{time}.pcapng', help='Output filename template')
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--bind-port', type=int, default=0, help='Local UDP port to bind to (0 for random)')
-    parser.add_argument('--buffer', type=int, default=100, help='Number of packets to buffer before writing to disk')
+    parser.add_argument('--buffer', type=int, default=100, help='Number of packets to buffer before writing to disk. Higher values increase efficiency but risk losing data on crash.')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--timeout', type=float, default=None, help='UDP response timeout in seconds (default: 0.5/frequency)')
     args = parser.parse_args()
 
-    # Reconfigure logging with user preference (case-insensitive)
     numeric_level = getattr(logging, args.log_level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f'Invalid log level: {args.log_level}')
@@ -460,7 +486,7 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             logger.info("Shutting down pedestal capture...")
     else:
-        loop = asyncio.get_event_loop()
+        loop = get_loop()
         try:
             loop.run_until_complete(main())
         except KeyboardInterrupt:
