@@ -17,10 +17,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger('capture_pedestals')
 
+def calculate_ip_checksum(header):
+    """Calculates the 16-bit one's complement sum of the IPv4 header."""
+    if len(header) % 2 == 1:
+        header += b'\x00'
+    
+    s = 0
+    for i in range(0, len(header), 2):
+        w = (header[i] << 8) + (header[i+1])
+        s += w
+    
+    s = (s >> 16) + (s & 0xffff)
+    s += (s >> 16)
+    return ~s & 0xffff
+
 def repack_science_packet(pixel_data, packet_no, boardloc, tai_seconds, nanoseconds):
-    """Repacks 256 pixel values into a 528-byte PANOSETI science packet."""
-    # Offset 0: acq_mode = 0x01 (PH)
-    # Offset 1: packet_ver = 1 (16-bit signed PH)
+    """
+    Repacks 256 pixel values into a 528-byte PANOSETI science packet.
+    
+    Header Layout (16 bytes):
+    - Offset 0 (1B): acq_mode (0x01 = Pulse Height)
+    - Offset 1 (1B): packet_ver (1 = 16-bit signed PH)
+    - Offset 2 (2B): packet_no (16-bit sequence number, Little-Endian)
+    - Offset 4 (2B): boardloc (16-bit location ID: bits 15:8=Aperture, 1:0=Quadrant)
+    - Offset 6 (4B): TAI (32-bit seconds since epoch)
+    - Offset 10 (4B): NANOSEC (32-bit nanoseconds since last tick)
+    - Offset 14 (2B): unused (Reserved)
+    """
     header = struct.pack('<BBHHIIH', 
                          0x01, 1, packet_no, boardloc, 
                          tai_seconds, nanoseconds, 0)
@@ -62,47 +85,80 @@ SITES = {
 }
 
 class PcapngWriter:
-    """Minimal Pcapng writer with support for SHB, IDB, and EPB."""
+    """Minimal Pcapng writer with support for SHB, IDB, and EPB with nanosecond precision."""
     def __init__(self, filename):
         self.filename = filename
         self.file = open(filename, 'wb')
         self._write_shb()
         self._write_idb()
+        self.file.flush()
+        logger.debug(f"PcapngWriter initialized: {filename}")
 
     def _write_shb(self):
         # Section Header Block (SHB)
+        # We'll add 'shb_os' and 'shb_userappl' options to look professional
+        os_str = "Linux".encode('utf-8')
+        os_pad = (4 - (len(os_str) % 4)) % 4
+        appl_str = "PANOSETI Pedestal Capture".encode('utf-8')
+        appl_pad = (4 - (len(appl_str) % 4)) % 4
+        
+        # Options: shb_os (12), shb_userappl (4), opt_endofopt (0)
+        options = (
+            struct.pack('<HH', 12, len(os_str)) + os_str + b'\x00' * os_pad +
+            struct.pack('<HH', 4, len(appl_str)) + appl_str + b'\x00' * appl_pad +
+            struct.pack('<HH', 0, 0)
+        )
+        
         shb_body = struct.pack('<IHHq', 0x1A2B3C4D, 1, 0, -1)
-        shb_len = 12 + len(shb_body) + 4
-        shb_block = struct.pack('<II', 0x0A0D0D0A, shb_len) + shb_body + struct.pack('<I', shb_len)
+        shb_len = 28 + len(options)
+        shb_block = struct.pack('<II', 0x0A0D0D0A, shb_len) + shb_body + options + struct.pack('<I', shb_len)
         self.file.write(shb_block)
 
     def _write_idb(self):
         # Interface Description Block (IDB)
+        # To get nanoseconds, we add the if_tsresol option (0x09)
+        # LinkType 1 = Ethernet.
         idb_body = struct.pack('<HHI', 1, 0, 65535)
-        idb_len = 12 + len(idb_body) + 4
-        idb_block = struct.pack('<II', 0x00000001, idb_len) + idb_body + struct.pack('<I', idb_len)
+        
+        # Option 9: if_tsresol (1 byte). Value 9 means 10^-9 (nanoseconds).
+        # Must pad to 4 bytes.
+        options = (
+            struct.pack('<HHB', 9, 1, 9) + b'\x00' * 3 +
+            struct.pack('<HH', 0, 0)
+        )
+        
+        idb_len = 20 + len(options)
+        idb_block = struct.pack('<II', 0x00000001, idb_len) + idb_body + options + struct.pack('<I', idb_len)
         self.file.write(idb_block)
 
-    def write_packet(self, data, ts_seconds, ts_nanoseconds):
-        # Enhanced Packet Block (EPB)
-        ts_micros = int(ts_seconds * 1_000_000 + ts_nanoseconds / 1000)
-        ts_high = ts_micros >> 32
-        ts_low = ts_micros & 0xFFFFFFFF
+    def write_batch(self, packet_batch):
+        """
+        Writes a batch of packets to disk in a single operation.
+        Each element in packet_batch is (data, ts_seconds, ts_nanoseconds).
+        """
+        blocks = []
+        for data, ts_seconds, ts_nanoseconds in packet_batch:
+            # Pcapng with if_tsresol=9 uses ticks of 10^-9.
+            ts_total_ns = int(ts_seconds) * 1_000_000_000 + int(ts_nanoseconds)
+            ts_high = ts_total_ns >> 32
+            ts_low = ts_total_ns & 0xFFFFFFFF
+            
+            cap_len = len(data)
+            padding_len = (4 - (cap_len % 4)) % 4
+            
+            # Type(4) + TotalLen(4) + InterfaceID(4) + TSHigh(4) + TSLow(4) + CapLen(4) + OrigLen(4) + Data + Padding + TotalLen(4)
+            # = 32 + data + padding
+            epb_len = 32 + cap_len + padding_len
+            
+            blocks.append(struct.pack('<IIIIIII', 0x00000006, epb_len, 0, ts_high, ts_low, cap_len, cap_len))
+            blocks.append(data)
+            blocks.append(b'\x00' * padding_len)
+            blocks.append(struct.pack('<I', epb_len))
         
-        cap_len = len(data)
-        padding_len = (4 - (cap_len % 4)) % 4
-        
-        epb_len = 32 + cap_len + padding_len + 4
-        
-        # Build the entire EPB block in memory
-        block_parts = [
-            struct.pack('<IIIIIII', 0x00000006, epb_len, 0, ts_high, ts_low, cap_len, cap_len),
-            data,
-            b'\x00' * padding_len,
-            struct.pack('<I', epb_len)
-        ]
-        self.file.write(b''.join(block_parts))
-        self.file.flush()
+        if blocks:
+            self.file.write(b''.join(blocks))
+            self.file.flush()
+            logger.debug(f"Wrote batch of {len(packet_batch)} packets to {self.filename}")
 
     def close(self):
         if self.file:
@@ -110,14 +166,19 @@ class PcapngWriter:
             self.file = None
 
 def create_ethernet_ip_udp_packet(payload, src_ip, dst_ip, src_port, dst_port):
-    """Wraps payload in Ethernet, IPv4, and UDP headers."""
+    """Wraps payload in Ethernet, IPv4 (with checksum), and UDP headers."""
     # Ethernet Header (14 bytes)
     eth_hdr = struct.pack('!6s6sH', b'\x00'*6, b'\x00'*6, 0x0800)
     
     # IPv4 Header (20 bytes)
     total_len = 20 + 8 + len(payload)
+    # Pack header with 0 checksum first
+    ip_hdr_no_cksum = struct.pack('!BBHHHBBH4s4s', 
+                                  0x45, 0, total_len, 0, 0x4000, 64, 17, 0, 
+                                  socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+    cksum = calculate_ip_checksum(ip_hdr_no_cksum)
     ip_hdr = struct.pack('!BBHHHBBH4s4s', 
-                         0x45, 0, total_len, 0, 0x4000, 64, 17, 0, 
+                         0x45, 0, total_len, 0, 0x4000, 64, 17, cksum, 
                          socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
     
     # UDP Header (8 bytes)
@@ -148,23 +209,35 @@ class QuaboManager(asyncio.DatagramProtocol):
         if future and not future.done():
             future.set_result(data)
 
-    async def trigger_quabo(self, ip, port, timeout=0.1):
+    async def trigger_quabo(self, ip, port, timeout=0.5):
         """Sends a trigger to a specific quabo and waits for the response."""
         loop = asyncio.get_event_loop()
         future = loop.create_future()
         addr = (ip, port)
         
-        # In case of multiple quabos on same IP (like localhost testing)
-        # We need a way to distinguish them if they share the same addr.
-        # But for quabos, addr IS the unique identifier.
+        # Safety: check if there's already a pending request for this address
+        if addr in self.pending_requests:
+            logger.debug(f"Overwriting pending request for {addr}")
+            old_future = self.pending_requests.pop(addr)
+            if not old_future.done():
+                old_future.cancel()
+
         self.pending_requests[addr] = future
         
         cmd = struct.pack('B', 0x0c) + b'\x00' * 63
-        self.transport.sendto(cmd, addr)
+        try:
+            self.transport.sendto(cmd, addr)
+        except OSError as e:
+            logger.error(f"Failed to send to {addr}: {e}")
+            self.pending_requests.pop(addr, None)
+            return None
         
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            data = await asyncio.wait_for(future, timeout=timeout)
+            logger.debug(f"Received {len(data)} bytes from {addr}")
+            return data
         except asyncio.TimeoutError:
+            logger.debug(f"Timeout waiting for response from {addr} (timeout={timeout}s)")
             self.pending_requests.pop(addr, None)
             return None
 
@@ -175,19 +248,23 @@ class QuaboClient:
         self.port = port
         self.quadrant = quadrant
         self.missing_count = 0
+        self.consecutive_misses = 0
+        self.is_down = False
 
 class PedestalGenerator:
     def __init__(self, args):
         self.args = args
         self.site_info = SITES[args.site]
         self.quabos = self._init_quabos()
+        self._validate_quabos()
         self.total_generated = 0
         self.cycle_count = 0
         self.pcap_writer = None
-        self.last_rollover = 0
+        self.last_rollover_sec = 0
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.manager = None
         self.transport = None
+        self.local_buffer = []
 
     def _init_quabos(self):
         clients = []
@@ -202,27 +279,57 @@ class PedestalGenerator:
             clients.append(QuaboClient(ip, port, i))
         return clients
 
-    async def _write_pcap_async(self, packet, ts_sec, ts_nano):
+    def _validate_quabos(self):
+        """Ensures all quabos have unique (IP, Port) pairs."""
+        addrs = set()
+        for q in self.quabos:
+            addr = (q.ip, q.port)
+            if addr in addrs:
+                raise ValueError(f"Duplicate quabo address identified: {addr}")
+            addrs.add(addr)
+
+    async def _flush_buffer_to_disk(self):
+        """Offloads the current local buffer to the PcapngWriter in the executor."""
+        if not self.local_buffer or not self.pcap_writer:
+            return
+        
+        batch = self.local_buffer
+        self.local_buffer = []
+        logger.debug(f"Flushing {len(batch)} packets to disk executor...")
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self.pcap_writer.write_packet, packet, ts_sec, ts_nano)
+        await loop.run_in_executor(self.executor, self.pcap_writer.write_batch, batch)
+
+    async def _write_pcap_async(self, packet, ts_sec, ts_nano):
+        # Buffer on the main loop to truly reduce thread context switching
+        self.local_buffer.append((packet, ts_sec, ts_nano))
+        logger.debug(f"Added packet to local buffer (size={len(self.local_buffer)})")
+        if len(self.local_buffer) >= self.args.buffer:
+            await self._flush_buffer_to_disk()
 
     async def _manage_rollover(self, ts_utc):
-        if self.pcap_writer is None or ts_utc - self.last_rollover > self.args.rollover:
+        """Handles pcapng file rollover. ts_utc is the integer trigger second."""
+        if self.pcap_writer is None or ts_utc - self.last_rollover_sec >= self.args.rollover:
             if self.pcap_writer:
-                self.pcap_writer.close()
+                await self._flush_buffer_to_disk()
+                # Close in the executor to avoid blocking
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(self.executor, self.pcap_writer.close)
+            
             dt = datetime.datetime.fromtimestamp(ts_utc)
             filename = self.args.output.format(
                 scope=self.site_info['scope'], date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
             )
             logger.info(f"Rolling over to {filename}")
             self.pcap_writer = PcapngWriter(filename)
-            self.last_rollover = ts_utc
+            self.last_rollover_sec = ts_utc
 
     async def watchdog_task(self):
         while True:
             await asyncio.sleep(180)
             missing = [q.missing_count for q in self.quabos]
             logger.info(f"Status: Total={self.total_generated}, Missing={missing}")
+            # Flush current buffer to disk every 3 mins for persistence
+            await self._flush_buffer_to_disk()
 
     async def run(self):
         loop = asyncio.get_event_loop()
@@ -233,54 +340,93 @@ class PedestalGenerator:
         )
         local_addr = self.transport.get_extra_info('sockname')
         logger.info(f"Starting pedestal capture for {self.site_info['scope']} at {self.args.frequency} Hz")
-        logger.info(f"Bound to local UDP port {local_addr[1]}")
+        logger.info(f"Bound to local UDP port {local_addr[1]} (buffer={self.args.buffer})")
         
         watchdog = asyncio.ensure_future(self.watchdog_task())
+        
+        # Anchor the schedule to a start of second to ensure triggers happen at .500
+        epoch = int(time.time())
+        now = time.time()
+        slot = 0
+        while epoch + (slot + 0.5) / self.args.frequency <= now:
+            slot += 1
 
+        # Create the initial pcap file immediately
+        await self._manage_rollover(epoch)
+            
         try:
             while True:
-                now = time.time()
-                sec_start = int(now)
-                k = 0
-                while True:
-                    trigger_time = sec_start + (k + 0.5) / self.args.frequency
-                    if trigger_time > now:
-                        break
-                    k += 1
+                trigger_time = epoch + (slot + 0.5) / self.args.frequency
+                logger.debug(f"Starting cycle {slot}, target trigger time: {trigger_time:.3f}")
+                sleep_dur = trigger_time - time.time()
                 
-                await asyncio.sleep(trigger_time - time.time())
+                if sleep_dur > 0:
+                    await asyncio.sleep(sleep_dur)
+                elif sleep_dur < -0.1:
+                    logger.warning(f"Cycle {slot} is late by {-sleep_dur:.3f}s")
                 
                 ts_utc = trigger_time
                 ts_tai = int(ts_utc) + self.args.tai_offset
-                nanosec = int(((k % self.args.frequency) + 0.5) / self.args.frequency * 1_000_000_000)
+                
+                slot_within_second = slot % self.args.frequency
+                nanosec = int((slot_within_second + 0.5) / self.args.frequency * 1_000_000_000)
 
-                # Trigger all quabos concurrently using the shared manager
-                tasks = [self.manager.trigger_quabo(q.ip, q.port) for q in self.quabos]
-                results = await asyncio.gather(*tasks)
+                # Use explicit timeout if provided, otherwise default to 0.5 * period
+                timeout = self.args.timeout if self.args.timeout is not None else 0.5 / self.args.frequency
 
-                await self._manage_rollover(ts_utc)
+                tasks = [self.manager.trigger_quabo(q.ip, q.port, timeout=timeout) for q in self.quabos]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
+                await self._manage_rollover(int(ts_utc))
+
+                responses_this_cycle = 0
                 for idx, data in enumerate(results):
+                    q = self.quabos[idx]
+                    if isinstance(data, Exception):
+                        logger.debug(f"Quabo {idx} error: {data}")
+                        data = None
+
                     if data and len(data) >= 516:
+                        responses_this_cycle += 1
+                        logger.debug(f"Quabo {idx} responded ({len(data)} bytes)")
+                        
+                        if q.is_down:
+                            logger.info(f"Quabo {idx} at {q.ip} has recovered.")
+                            q.is_down = False
+                        q.consecutive_misses = 0
+                        
                         boardloc = (self.site_info['module_id'] << 2) | idx
                         science_payload = repack_science_packet(
                             data[4:516], self.cycle_count % 65536, 
                             boardloc, ts_tai, nanosec
                         )
                         full_packet = create_ethernet_ip_udp_packet(
-                            science_payload, self.quabos[idx].ip, 
+                            science_payload, q.ip, 
                             self.site_info['daq_ip'], 60001, 60001
                         )
                         await self._write_pcap_async(full_packet, int(ts_utc), nanosec)
                         self.total_generated += 1
                     else:
-                        self.quabos[idx].missing_count += 1
+                        q.missing_count += 1
+                        q.consecutive_misses += 1
+                        if q.consecutive_misses >= 5 and not q.is_down:
+                            logger.warning(f"Quabo {idx} at {q.ip} is not responding (5 consecutive misses). It might be down.")
+                            q.is_down = True
+                
+                if responses_this_cycle > 0 and self.total_generated <= 4:
+                    logger.info(f"Received first {responses_this_cycle} responses from quabos.")
                 
                 self.cycle_count += 1
+                slot += 1
         finally:
             watchdog.cancel()
             if self.pcap_writer:
-                self.pcap_writer.close()
+                try:
+                    await asyncio.shield(self._flush_buffer_to_disk())
+                    loop = asyncio.get_event_loop()
+                    await asyncio.shield(loop.run_in_executor(self.executor, self.pcap_writer.close))
+                except Exception as e:
+                    logger.error(f"Error during final flush: {e}")
             if self.transport:
                 self.transport.close()
             self.executor.shutdown()
@@ -293,23 +439,31 @@ async def main():
     parser.add_argument('--output', '-o', default='pedestals_{scope}_{date}_{time}.pcapng', help='Output filename template')
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--bind-port', type=int, default=0, help='Local UDP port to bind to (0 for random)')
+    parser.add_argument('--buffer', type=int, default=100, help='Number of packets to buffer before writing to disk')
+    parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
+    parser.add_argument('--timeout', type=float, default=None, help='UDP response timeout in seconds (default: 0.5/frequency)')
     args = parser.parse_args()
+
+    # Reconfigure logging with user preference (case-insensitive)
+    numeric_level = getattr(logging, args.log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError(f'Invalid log level: {args.log_level}')
+    logging.getLogger().setLevel(numeric_level)
 
     generator = PedestalGenerator(args)
     await generator.run()
 
 if __name__ == "__main__":
-    # Python 3.7+ has asyncio.run, but we maintain 3.6 compatibility
     if hasattr(asyncio, 'run'):
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
-            pass
+            logger.info("Shutting down pedestal capture...")
     else:
         loop = asyncio.get_event_loop()
         try:
             loop.run_until_complete(main())
         except KeyboardInterrupt:
-            pass
+            logger.info("Shutting down pedestal capture...")
         finally:
             loop.close()
