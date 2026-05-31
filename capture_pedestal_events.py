@@ -159,11 +159,11 @@ class PcapngWriter:
             blocks.append(data)
             blocks.append(b'\x00' * padding_len)
             blocks.append(struct.pack('<I', epb_len))
-            self.packets_written += 1
         
         if blocks:
             self.file.write(b''.join(blocks))
             self.file.flush()
+            self.packets_written += len(packet_batch)
 
     def close(self):
         if self.file:
