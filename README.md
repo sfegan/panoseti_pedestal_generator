@@ -38,10 +38,10 @@ Raw response packets contain a 4-byte header and 512 bytes of pixel data (256 ch
 | `4` | 2B | `boardloc` | Location ID: `(Module ID << 2) \| Quadrant` |
 | `6` | 4B | `TAI` | TAI seconds since epoch (`UTC + tai_offset`) |
 | `10` | 4B | `NANOSEC` | Sub-second trigger time in nanoseconds |
-| `14` | 2B | *Reserved* | 0x0001 |
+| `14` | 2B | *Reserved* (or *Flags*?) | 0x0001 |
 | `16` | 512B | `pixel_data` | 256 pixel values (16-bit signed integers) |
 
-Note: I propose that the *Reserved* field be considered as a *Flags* field in the future, allowing for future expansion without breaking compatibility. Here I propose that bit 0 (LSB) be used to indicate whether the payload contains a software triggered event.
+**Note:** I propose that the *Reserved* field be considered as a *Flags* field in the future, allowing for future expansion without breaking compatibility. Here I propose that bit 0 (LSB) be used to indicate whether the payload contains a software triggered event.
 
 ### 4. Ethernet/IP/UDP Encapsulation
 To match the format of physical network captures, the 528-byte science payload is wrapped in standard headers:
