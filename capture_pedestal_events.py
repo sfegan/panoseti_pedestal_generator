@@ -20,6 +20,24 @@ logger = logging.getLogger('capture_pedestals')
 MAX_FREQUENCY = 1000   # Hard upper limit (Hz)
 MIN_TIMEOUT   = 0.002  # Hard lower limit on auto-computed timeout (seconds)
 
+# Pre-built trigger command — 64 bytes, first byte 0x0c, rest zero.
+# Built once at import time so struct.pack() is never called in the hot path.
+_TRIGGER_CMD = struct.pack('B', 0x0c) + b'\x00' * 63
+
+# Payload size constants for science packet extraction
+_PKT_HEADER_OFFSET = 4    # bytes to skip at start of raw quabo response
+_PKT_PAYLOAD_END   = 516  # end of the 512-byte pixel payload
+
+# Sentinel placed on the write queue to request a file rollover.
+# The disk-writer coroutine closes old_writer, opens new_filename,
+# and posts the resulting PcapngWriter back on reply_queue.
+class _RolloverCmd:
+    __slots__ = ('old_writer', 'new_filename', 'reply_queue')
+    def __init__(self, old_writer, new_filename, reply_queue):
+        self.old_writer   = old_writer
+        self.new_filename = new_filename
+        self.reply_queue  = reply_queue
+
 def calculate_ip_checksum(header):
     """Calculates the 16-bit one's complement sum of the IPv4 header."""
     if len(header) % 2 == 1:
@@ -188,44 +206,69 @@ class QuaboManager(asyncio.DatagramProtocol):
     """Manages a single persistent UDP socket for all quabos."""
     def __init__(self):
         self.transport = None
-        self.pending_requests = {} # (ip, port) -> Future
+        self.pending_requests = {}  # (ip, port) -> Future
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        # addr is (ip, port)
         future = self.pending_requests.pop(addr, None)
         if future and not future.done():
             future.set_result(data)
 
-    async def trigger_quabo(self, ip, port, timeout=0.5):
-        """Sends a trigger to a specific quabo and waits for the response."""
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        addr = (ip, port)
-        
-        # Safety: check if there's already a pending request for this address
-        if addr in self.pending_requests:
-            logger.debug(f"Overwriting pending request for {addr}")
-            old_future = self.pending_requests.pop(addr)
-            if not old_future.done():
-                old_future.cancel()
+    def send_all(self, quabos):
+        """
+        Send trigger commands to all quabos in a single synchronous burst.
+        Registers a Future for each board and fires all sendto() calls with no
+        await between them, minimising the skew between the first and last packet
+        on the wire.  Returns the list of futures in quabo order.
 
-        self.pending_requests[addr] = future
-        
-        cmd = struct.pack('B', 0x0c) + b'\x00' * 63
-        try:
-            self.transport.sendto(cmd, addr)
-        except OSError as e:
-            self.pending_requests.pop(addr, None)
-            return None
-        
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            self.pending_requests.pop(addr, None)
-            return None
+        Must be called from the event loop thread (i.e. not from an executor).
+        """
+        loop    = asyncio.get_running_loop()
+        futures = []
+        for q in quabos:
+            addr = (q.ip, q.port)
+            # Cancel any stale future for this address
+            old = self.pending_requests.pop(addr, None)
+            if old and not old.done():
+                logger.debug(f"Overwriting pending request for {addr}")
+                old.cancel()
+            fut = loop.create_future()
+            self.pending_requests[addr] = fut
+            futures.append((addr, fut))
+
+        # All futures registered — now blast the packets with no yields between.
+        sent_futures = []
+        for addr, fut in futures:
+            try:
+                self.transport.sendto(_TRIGGER_CMD, addr)
+                sent_futures.append(fut)
+            except OSError:
+                self.pending_requests.pop(addr, None)
+                if not fut.done():
+                    fut.cancel()
+                sent_futures.append(None)
+        return sent_futures
+
+    @staticmethod
+    async def wait_all(futures, timeout):
+        """
+        Await all futures returned by send_all() with a shared timeout.
+        Returns a list of (data | None) in the same order as the futures.
+        None means timeout or send error.
+        """
+        results = []
+        for fut in futures:
+            if fut is None:
+                results.append(None)
+                continue
+            try:
+                data = await asyncio.wait_for(fut, timeout=timeout)
+                results.append(data)
+            except asyncio.TimeoutError:
+                results.append(None)
+        return results
 
 class QuaboClient:
     """Helper to track state for a single quabo board."""
@@ -314,21 +357,59 @@ class PedestalGenerator:
 
     async def _disk_writer(self):
         """
-        Dedicated coroutine that drains the write queue and offloads batches to
-        the executor thread.  Acquisition never awaits disk I/O directly.
-        A sentinel value of None signals clean shutdown.
+        Dedicated coroutine that drains the write queue and offloads work to
+        the executor thread.  Handles three item types:
+          - (writer, batch)  : write a packet batch to disk
+          - _RolloverCmd     : close old file, open new file, reply with new writer
+          - None             : shutdown sentinel — drain remaining items then exit
         """
         loop = asyncio.get_running_loop()
         while True:
             item = await self._write_queue.get()
-            if item is None:          # shutdown sentinel
-                self._write_queue.task_done()
-                break
-            writer, batch = item
+
             try:
-                await loop.run_in_executor(self.executor, writer.write_batch, batch)
-            except Exception as e:
-                self.log("error", f"Disk write error: {e}")
+                if item is None:
+                    # Shutdown sentinel — exit after acknowledging
+                    break
+
+                if isinstance(item, _RolloverCmd):
+                    cmd = item
+                    # Close the old file in the executor (may flush OS buffers)
+                    if cmd.old_writer is not None:
+                        try:
+                            await loop.run_in_executor(
+                                self.executor, cmd.old_writer.close)
+                            self.log("info",
+                                     f"Closed {cmd.old_writer.filename}, "
+                                     f"{cmd.old_writer.packets_written} packets written.")
+                        except Exception as e:
+                            self.log("error", f"Error closing pcap file: {e}")
+
+                    # Open the new file in the executor so the event loop is
+                    # never blocked by the open() + SHB/IDB header writes.
+                    # new_filename is None on the shutdown path — no new file needed.
+                    new_writer = None
+                    if cmd.new_filename is not None:
+                        try:
+                            new_writer = await loop.run_in_executor(
+                                self.executor,
+                                PcapngWriter, cmd.new_filename)
+                            self.log("info", f"Opened {cmd.new_filename}")
+                        except Exception as e:
+                            self.log("error", f"Error opening pcap file {cmd.new_filename}: {e}")
+
+                    # Hand the result back to the acquisition loop.
+                    await cmd.reply_queue.put(new_writer)
+
+                else:
+                    # Normal case: (writer, batch)
+                    writer, batch = item
+                    try:
+                        await loop.run_in_executor(
+                            self.executor, writer.write_batch, batch)
+                    except Exception as e:
+                        self.log("error", f"Disk write error: {e}")
+
             finally:
                 self._write_queue.task_done()
 
@@ -377,27 +458,55 @@ class PedestalGenerator:
         self._write_pcap(packet, ts_sec, ts_nano)
 
     async def _manage_rollover(self, ts_utc):
-        """Handles pcapng file rollover. ts_utc is the integer trigger second."""
-        if self.pcap_writer is None or ts_utc - self.last_rollover_sec >= self.args.rollover:
-            if self.pcap_writer:
-                # Enqueue any remaining buffered packets for the old file, then
-                # wait for the queue to drain before closing so write_batch and
-                # close() can never race on the executor thread.
-                self._flush_buffer_to_queue()
-                await self._write_queue.join()
-                filename = self.pcap_writer.filename
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(self.executor, self.pcap_writer.close)
-                self.log("info", f"Closing {filename}, {self.pcap_writer.packets_written} packets written to file.")
-            
-            dt = datetime.datetime.fromtimestamp(ts_utc)
-            filename = self.args.output.format(
-                scope=self.scope, date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
-            )
-            self.log("info", f"Opening {filename}")
-            self.pcap_writer = PcapngWriter(filename)
-            self.local_buffer = []
-            self.last_rollover_sec = ts_utc
+        """
+        Check whether a file rollover is due and, if so, initiate one
+        non-blockingly.
+
+        For the very first file (pcap_writer is None) we must wait for the
+        writer to be ready before the acquisition loop can start, so we await
+        the reply.  For subsequent rollovers we enqueue the command and await
+        the reply — this still blocks the main loop for one rollover cycle, but
+        since rollover only happens every --rollover seconds (default 600s) the
+        practical impact is negligible, and it avoids the complexity of
+        double-buffering writes across two file handles simultaneously.
+
+        All file open/close I/O is performed inside the executor thread via
+        _disk_writer, so the event loop is never blocked by filesystem calls.
+        """
+        if self.pcap_writer is not None and ts_utc - self.last_rollover_sec < self.args.rollover:
+            return  # No rollover needed
+
+        dt       = datetime.datetime.fromtimestamp(ts_utc)
+        filename = self.args.output.format(
+            scope=self.scope, date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
+        )
+
+        # Flush any buffered packets for the old writer before we ask the
+        # disk-writer to close it, so the batch lands before the close.
+        self._flush_buffer_to_queue()
+
+        reply_queue = asyncio.Queue(maxsize=1)
+        cmd = _RolloverCmd(
+            old_writer   = self.pcap_writer,   # None on first call
+            new_filename = filename,
+            reply_queue  = reply_queue,
+        )
+        # Use put_nowait here: the write queue must have space because we
+        # sized it generously (100 slots) and a rollover is rare.
+        try:
+            self._write_queue.put_nowait(cmd)
+        except asyncio.QueueFull:
+            # Last-resort fallback: block until there is space.
+            self.log("warning", "Write queue full at rollover — waiting for space")
+            await self._write_queue.put(cmd)
+
+        # Wait for the disk-writer to open the new file and hand it back.
+        new_writer = await reply_queue.get()
+        if new_writer is None:
+            self.log("error", f"Failed to open new pcap file {filename} — acquisition continues with no output")
+        self.pcap_writer       = new_writer
+        self.local_buffer      = []
+        self.last_rollover_sec = ts_utc
 
     async def _watchdog(self):
         while True:
@@ -466,7 +575,7 @@ class PedestalGenerator:
         period = 1 / self.args.frequency
         try:
             while True:
-                trigger_wall = wall_epoch + (slot + 0.5) * period
+                trigger_wall = wall_epoch + (slot + 0.5) / self.args.frequency
                 trigger_mono = mono_epoch + (slot + 0.5) * period
 
                 sleep_dur = trigger_mono - time.monotonic()
@@ -480,47 +589,49 @@ class PedestalGenerator:
                 if sleep_dur > 0:
                     await asyncio.sleep(sleep_dur)
 
+                # ---- Packets on the wire as fast as possible after wake ----
+                # send_all() is synchronous: all sendto() calls happen with no
+                # await between them, so inter-board skew is only syscall time.
+                futures = self.manager.send_all(self.quabos)
+
                 self.log("debug", f"Starting cycle {slot}, target trigger time: {trigger_wall:.3f}")
-                
+
                 ts_utc = trigger_wall
                 ts_tai = int(ts_utc) + self.args.tai_offset
-                
                 slot_within_second = slot % self.args.frequency
-                nanosec = int((slot_within_second + 0.5) / self.args.frequency * 1_000_000_000)
+                nanosec = int((slot_within_second + 0.5) * period * 1_000_000_000)
 
-                tasks = [self.manager.trigger_quabo(q.ip, q.port, timeout=timeout) for q in self.quabos]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # Now await responses — timeout is shared across all boards.
+                results = await self.manager.wait_all(futures, timeout)
 
+                # Post-receive housekeeping (rollover, stats, buffering) — all
+                # of this happens after packets are already on the wire.
                 await self._manage_rollover(int(ts_utc))
                 self.total_generated += 1
                 self.generated_since_last_report += 1
 
                 for idx, data in enumerate(results):
                     q = self.quabos[idx]
-                    if isinstance(data, Exception):
-                        self.log("debug", f"Quabo {idx} error: {data}")
-                        data = None
 
                     if data and len(data) >= 516:
                         self.log("debug", f"Quabo {idx} responded ({len(data)} bytes)")
 
-                        # Log the very first response from each board individually
                         if not q.first_response_logged:
                             self.log("info", f"Quabo {idx} at {q.ip} is responding.")
                             q.first_response_logged = True
-                        
+
                         if q.is_down:
                             self.log("info", f"Quabo {idx} at {q.ip} has recovered.")
                             q.is_down = False
                         q.consecutive_misses = 0
-                        
+
                         boardloc = (self.site_info['module_id'] << 2) | idx
                         science_payload = repack_science_packet(
-                            data[4:516], self.cycle_count % 65536, 
+                            data[_PKT_HEADER_OFFSET:_PKT_PAYLOAD_END], self.cycle_count % 65536,
                             boardloc, ts_tai, nanosec
                         )
                         full_packet = create_ethernet_ip_udp_packet(
-                            science_payload, q.ip, 
+                            science_payload, q.ip,
                             self.site_info['daq_ip'], 60001, 60001
                         )
                         await self._write_pcap_async(full_packet, int(ts_utc), nanosec)
@@ -530,9 +641,11 @@ class PedestalGenerator:
                         q.misses_since_last_report += 1
                         q.consecutive_misses += 1
                         if q.consecutive_misses >= 5 and not q.is_down:
-                            self.log("warning", f"Quabo {idx} at {q.ip} is not responding (5 consecutive misses). It might be down.")
+                            self.log("warning",
+                                     f"Quabo {idx} at {q.ip} is not responding "
+                                     f"(5 consecutive misses). It might be down.")
                             q.is_down = True
-                
+
                 self.cycle_count += 1
                 slot += 1
         finally:
@@ -541,23 +654,26 @@ class PedestalGenerator:
             # ----------------------------------------------------------------
             self._flush_buffer_to_queue()
 
-            # Signal the writer task to exit after draining
+            # Close the current pcap file by sending a final rollover command
+            # with no new filename, then send the shutdown sentinel.
+            if self.pcap_writer is not None:
+                reply_queue = asyncio.Queue(maxsize=1)
+                await self._write_queue.put(_RolloverCmd(
+                    old_writer   = self.pcap_writer,
+                    new_filename = None,   # no new file on shutdown
+                    reply_queue  = reply_queue,
+                ))
+                self.pcap_writer = None
+                # Wait for the close to complete before sending the sentinel
+                await reply_queue.get()
+
+            # Shutdown sentinel — _disk_writer exits after processing this
             await self._write_queue.put(None)
             try:
                 await asyncio.wait_for(self._writer_task, timeout=10.0)
             except asyncio.TimeoutError:
                 self.log("error", "Writer task did not finish in time — some data may be lost")
                 self._writer_task.cancel()
-
-            if self.pcap_writer:
-                try:
-                    filename = self.pcap_writer.filename
-                    count = self.pcap_writer.packets_written
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(self.executor, self.pcap_writer.close)
-                    self.log("info", f"Closing {filename}, {count} packets written to file.")
-                except Exception as e:
-                    self.log("error", f"Error closing pcap file: {e}")
 
             self._watchdog_task.cancel()
             try:
