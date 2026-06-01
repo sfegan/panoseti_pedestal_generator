@@ -473,15 +473,19 @@ class PedestalGenerator:
 
     async def _manage_rollover(self, ts_utc):
         """Signals the background thread to roll over the file."""
-        if self.last_rollover_sec == 0 or ts_utc - self.last_rollover_sec >= self.args.rollover:
+        # Check if a rollover is due. If args.rollover is 0, we never roll over.
+        is_due = (self.last_rollover_sec == 0 or 
+                  (self.args.rollover > 0 and ts_utc - self.last_rollover_sec >= self.args.rollover))
+
+        if is_due:
             self._flush_buffer_to_queue()
-            
+
             dt = datetime.datetime.fromtimestamp(ts_utc)
             filename = self.args.output.format(
                 scope=self.scope, date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
             )
-            self.logger.info(f"Requesting file rollover to {filename}")
-            
+            self.logger.debug(f"Requesting file rollover to {filename}")
+
             # Send a "ROLLOVER" command
             self._enqueue_item(("ROLLOVER", filename))
             self.last_rollover_sec = ts_utc
@@ -686,8 +690,8 @@ async def main():
 
     if args.buffer < 1:
         parser.error('--buffer must be >= 1')
-    if args.rollover < 1:
-        parser.error('--rollover must be >= 1')
+    if args.rollover < 0:
+        parser.error('--rollover must be >= 0')
     if args.timeout is not None and args.timeout <= 0:
         parser.error('--timeout must be > 0')
 
