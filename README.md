@@ -1,14 +1,14 @@
 # PANOSETI Pedestal Generator
 
-This repository contains tools to trigger and capture pedestal events from PANOSETI detector modules:
-- `capture_pedestal_events.py`: Polls detector boards (Quabos) for Software Pulse Height (SW PH) pedestals, wraps the payloads in Ethernet/IP/UDP headers, and writes them to a `.pcapng` file.
+This repository contains a tool to trigger and capture pedestal events from PANOSETI detector modules:
+- `capture_pedestal_events.py`: Polls detector boards (Quabos) for software-generated Pulse Height pedestals events, wraps the payloads in Ethernet/IP/UDP headers, and writes them to a `.pcapng` file.
 - `quabo_emulator.py`: Emulates four Quabo boards responding to SW PH trigger commands with normal-distributed random pixel values for testing.
 
 ---
 
 ## Pedestal Events
 
-In PANOSETI, pedestal events measure the baseline pixel amplitudes when no optical pulse is present. Because silicon photomultipliers (SiPMs) and readout electronics baseline levels drift over time (due to temperature, voltage variations, etc.), periodic calibration measurements are recorded (typically at 1 Hz). These are used downstream to compute the average baseline per pixel, monitor background variance, and subtract the baseline during pulse analysis.
+Pedestal events sample the baseline pixel amplitudes when no trigger is present. These can be used downstream to estimate the average baseline per pixel and its variance. These are used in a gamma-ray analysis to subtract the baseline during pulse analysis and to fit the pointing model based on the contribution of starlist to the pixel variance. Exterally generated pedestal events improve the measurement of these values by increasing the sampling to any desired rate, independent of the actual trigger rate of the system.
 
 ---
 
@@ -17,13 +17,13 @@ In PANOSETI, pedestal events measure the baseline pixel amplitudes when no optic
 `capture_pedestal_events.py` polls a module of four Quabo boards (each processing 256 pixels) and records the responses.
 
 ### 1. Timing and Scheduling
-The script schedules polling times relative to the system clock. Triggers are scheduled at:
+The script uses a software-based phase-locked loop to schedule polling times relative to the system clock. Triggers are scheduled at:
 $$\text{Trigger Time} = \text{Epoch} + \frac{\text{Slot} + 0.5}{\text{Frequency}}$$
 The script sleeps using `asyncio.sleep` until the scheduled time. If a cycle is delayed by more than 0.1 seconds, a warning is logged.
 
 ### 2. UDP Polling
 The script binds to a single local UDP port using an `asyncio.DatagramProtocol` subclass (`QuaboManager`).
-* In each cycle, it sends a 64-byte command (first byte `0x0c` followed by zeros) to the four configured Quabo boards concurrently.
+* In each cycle, it sends the 64-byte "SW_PH" command (first byte `0x0c` followed by zeros) to the four configured Quabo boards concurrently.
 * It waits for responses with a configurable timeout (defaulting to $0.5 / \text{frequency}$).
 * Responses are matched to pending requests using the sender's `(IP, Port)` address.
 
@@ -38,8 +38,10 @@ Raw response packets contain a 4-byte header and 512 bytes of pixel data (256 ch
 | `4` | 2B | `boardloc` | Location ID: `(Module ID << 2) \| Quadrant` |
 | `6` | 4B | `TAI` | TAI seconds since epoch (`UTC + tai_offset`) |
 | `10` | 4B | `NANOSEC` | Sub-second trigger time in nanoseconds |
-| `14` | 2B | *Reserved* | Zeros |
+| `14` | 2B | *Reserved* | 0x0001 |
 | `16` | 512B | `pixel_data` | 256 pixel values (16-bit signed integers) |
+
+Note: I propose that the *Reserved* field be considered as a *Flags* field in the future, allowing for future expansion without breaking compatibility. Here I propose that bit 0 (LSB) be used to indicate whether the payload contains a software triggered event.
 
 ### 4. Ethernet/IP/UDP Encapsulation
 To match the format of physical network captures, the 528-byte science payload is wrapped in standard headers:
@@ -113,3 +115,8 @@ python3 capture_pedestal_events.py --site localhost --frequency 4 --buffer 10 --
 * `--frequency 4` sets the polling rate to 4 Hz.
 * `--buffer 10` flushes packets to disk in batches of 10.
 * `--rollover 60` rolls over to a new file every 60 seconds.
+
+## References:
+
+- [PANOSETI quabo packet interface](https://github.com/panoseti/panoseti/wiki/Quabo-packet-interface)
+- [PANOSET control_quabo.py test script](https://github.com/panoseti/panoseti/blob/master/control/test_scripts/control_quabo.py) (see "R-PH" command handling)
