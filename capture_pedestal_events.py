@@ -36,13 +36,17 @@ MIN_TIMEOUT   = 0.002  # Hard lower limit on auto-computed timeout (seconds)
 
 # Constants for Zero-Join Buffer (Pcapng EPB + Ethernet + IP + UDP + Science + Payload)
 # Ethernet(14) + IP(20) + UDP(8) + Science(16) + Payload(512) = 570 bytes.
-# EPB alignment: 570 % 4 = 2 bytes padding.
-# Total EPB block: 32 (HDR) + 570 (DATA) + 2 (PAD) + 4 (FTR) = 608 bytes.
-_EPB_TOTAL_LEN  = 608
 _CAPTURE_LEN    = 570
 _SCIENCE_LEN    = 528 # 16 + 512
+
+# EPB alignment: must be 32-bit (4-byte) aligned.
+_PAD_LEN        = (4 - (_CAPTURE_LEN % 4)) % 4
+_EPB_TOTAL_LEN  = 32 + _CAPTURE_LEN + _PAD_LEN + 4
+
 _EPB_HDR_FORMAT = '<IIIIIII'
 _EPB_FTR_FORMAT = '<I'
+
+# Science header is Little-Endian per QUABO wire format specification.
 _SCIENCE_HDR_FORMAT = '<BBHHIIH'
 
 # Pre-built trigger command — 64 bytes, first byte 0x0c, rest zero.
@@ -111,7 +115,12 @@ SITES = {
 }
 
 class PcapngWriter:
-    """Minimal Pcapng writer with support for SHB, IDB, and EPB with nanosecond precision."""
+    """
+    Minimal Pcapng writer with support for SHB, IDB, and EPB with nanosecond precision.
+    
+    NOTE: Construction and close() involve synchronous file I/O and should be 
+    performed inside a ThreadPoolExecutor to avoid blocking the event loop.
+    """
     def __init__(self, filename):
         self.filename = filename
         self.file = open(filename, 'wb')
@@ -216,21 +225,31 @@ class QuaboManager(asyncio.DatagramProtocol):
     @staticmethod
     async def wait_all(futures, timeout):
         """
-        Await all futures returned by send_all() with a shared timeout.
+        Await all futures returned by send_all() with a shared total timeout.
         Returns a list of (data | None) in the same order as the futures.
-        None means timeout or send error.
+        None means timeout, cancel, or send error.
         """
-        results = []
+        # Create a single list of tasks. None values from send_all are 
+        # converted to dummy coroutines that return None.
+        tasks = []
         for fut in futures:
             if fut is None:
-                results.append(None)
-                continue
-            try:
-                data = await asyncio.wait_for(fut, timeout=timeout)
-                results.append(data)
-            except asyncio.TimeoutError:
-                results.append(None)
-        return results
+                async def _none(): return None
+                tasks.append(_none())
+            else:
+                tasks.append(fut)
+
+        try:
+            # Parallel wait for all responses with one global timeout
+            return await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+        except asyncio.TimeoutError:
+            # On timeout, cancel all pending futures and return None for everything
+            for fut in futures:
+                if fut and not fut.done():
+                    fut.cancel()
+            return [None] * len(futures)
+        except Exception:
+            return [None] * len(futures)
 
 class QuaboClient:
     """Helper to track state for a single quabo board."""
@@ -390,12 +409,69 @@ class PedestalGenerator:
             finally:
                 self._write_queue.task_done()
 
+    def _init_quabos(self):
+        """
+        Initializes QuaboClient objects. NOTE: Hostname resolution is performed
+        synchronously here, which is acceptable during startup before the loop.
+        """
+        clients = []
+        if self.args.quabos:
+            for i, q_str in enumerate(self.args.quabos):
+                if ':' in q_str:
+                    host, port_str = q_str.rsplit(':', 1)
+                    try:
+                        port = int(port_str)
+                    except ValueError:
+                        host, port = q_str, 60000
+                else:
+                    host, port = q_str, 60000
+                
+                # Resolve hostname to IP to ensure QuaboManager matching works
+                try:
+                    resolved_ip = socket.gethostbyname(host)
+                    self.logger.info(f"Resolved {host} to {resolved_ip}")
+                except socket.gaierror:
+                    self.logger.error(f"Could not resolve hostname: {host}")
+                    resolved_ip = host
+                
+                clients.append(QuaboClient(resolved_ip, port, i))
+        else:
+            base_ip = self.site_info['base_ip']
+            for i in range(4):
+                if self.site_info.get('use_ports'):
+                    ip, port = base_ip, 60000 + i
+                else:
+                    ip_parts = base_ip.split('.')
+                    ip_parts[-1] = str(int(ip_parts[-1]) + i)
+                    ip, port = '.'.join(ip_parts), 60000
+                clients.append(QuaboClient(ip, port, i))
+        return clients
+
+    def _validate_quabos(self):
+        """Ensures all quabos have unique (IP, Port) pairs."""
+        addrs = set()
+        for q in self.quabos:
+            addr = (q.ip, q.port)
+            if addr in addrs:
+                raise ValueError(f"Duplicate quabo address identified: {addr}")
+            addrs.add(addr)
+
     def _enqueue_item(self, item):
-        """Non-blocking enqueue for commands and data."""
+        """
+        Non-blocking enqueue for commands and data.
+        Only "DATA" items are eligible for dropping during queue overflows.
+        """
         try:
             self._write_queue.put_nowait(item)
         except asyncio.QueueFull:
-            self.logger.warning("Write queue full — dropping oldest item to protect timing")
+            if item[0] != "DATA":
+                # Critical commands (ROLLOVER, SHUTDOWN) must not be dropped.
+                # Use a background task to ensure they are eventually processed.
+                self.logger.warning(f"Write queue full — enqueuing critical command {item[0]} in background")
+                asyncio.create_task(self._write_queue.put(item))
+                return
+
+            self.logger.warning("Write queue full — dropping oldest DATA item to protect timing")
             try:
                 self._write_queue.get_nowait()
                 self._write_queue.task_done()
@@ -405,7 +481,6 @@ class PedestalGenerator:
                 self._write_queue.put_nowait(item)
             except asyncio.QueueFull:
                 self.logger.error("Write queue still full after drop — item lost")
-
     def _write_pcap(self, q_idx, pixel_data, ts_tai, nanosec, ts_utc):
         """
         Assembles a full Pcapng EPB (including Network and Science headers)
@@ -430,27 +505,33 @@ class PedestalGenerator:
             # Static Eth + IP (34B)
             self.buffer[ptr+32:ptr+66] = q.precalculated_net_hdr
             
-            # Assembly science payload to calculate UDP checksum
-            sci_hdr = struct.pack(_SCIENCE_HDR_FORMAT, 0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
-            payload = sci_hdr + pixel_data
+            # 3. Science Header (16B) - written early for checksumming
+            sci_ptr = ptr + 74
+            struct.pack_into(_SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
+                             0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
             
-            udp_cksum = calculate_udp_checksum(q.ip, self.site_info['daq_ip'], q.udp_hdr_base + b'\x00\x00', payload)
+            # 4. Pixel Data (512B) - written early for checksumming
+            self.buffer[sci_ptr+16:sci_ptr+528] = pixel_data
+            
+            # Calculate UDP checksum using a memoryview of the assembled payload
+            payload_view = memoryview(self.buffer)[sci_ptr:sci_ptr+528]
+            udp_cksum = calculate_udp_checksum(q.ip, self.site_info['daq_ip'], q.udp_hdr_base + b'\x00\x00', payload_view)
             
             # UDP Header (8B)
             self.buffer[ptr+66:ptr+72] = q.udp_hdr_base
             struct.pack_into('!H', self.buffer, ptr+72, udp_cksum)
-            sci_ptr = ptr + 74
 
-        # 3. Science Header (16B)
-        struct.pack_into(_SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
-                         0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
+        if not self.args.checksums:
+            # 3. Science Header (16B)
+            struct.pack_into(_SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
+                             0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
+            
+            # 4. Pixel Data (512B)
+            self.buffer[sci_ptr+16:sci_ptr+528] = pixel_data
         
-        # 4. Pixel Data (512B)
-        self.buffer[sci_ptr+16:sci_ptr+528] = pixel_data
-        
-        # 5. EPB Padding (2B) and Footer (4B)
-        self.buffer[ptr+602:ptr+604] = b'\x00\x00'
-        struct.pack_into(_EPB_FTR_FORMAT, self.buffer, ptr+604, _EPB_TOTAL_LEN)
+        # 5. EPB Padding and Footer
+        self.buffer[ptr+32+_CAPTURE_LEN:ptr+32+_CAPTURE_LEN+_PAD_LEN] = b'\x00' * _PAD_LEN
+        struct.pack_into(_EPB_FTR_FORMAT, self.buffer, ptr+_EPB_TOTAL_LEN-4, _EPB_TOTAL_LEN)
         
         self.buffer_ptr += _EPB_TOTAL_LEN
         self.buffer_count += 1
@@ -575,7 +656,7 @@ class PedestalGenerator:
                 trigger_mono = mono_epoch + (slot + 0.5) * period
 
                 sleep_dur = trigger_mono - time.monotonic()
-                while sleep_dur < -0.1: #* self.args.frequency < -0.2:
+                while sleep_dur < -0.1:
                     if self.dropped_cycles == 0:
                         self.logger.warning(f"Cycle {slot} is late by {-sleep_dur:.4f}s .. dropping to catch up (further warnings suppressed until next report)")
                     self.dropped_cycles += 1
@@ -674,7 +755,7 @@ async def main():
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--bind-port', type=int, default=0, help='Local UDP port to bind to (0 for random)')
     parser.add_argument('--buffer', type=int, default=None, help='Number of packets to buffer before writing to disk. Default: frequency (clamped 60–1000)')
-    parser.add_argument('--compute_checksums', action='store_true', help='Enable IP and UDP checksum calculation (CPU intensive)')
+    parser.add_argument('--checksums', action='store_true', help='Enable IP and UDP checksum calculation (CPU intensive)')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/frequency))')
     parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
@@ -697,7 +778,7 @@ async def main():
 
     numeric_level = getattr(logging, args.log_level.upper(), None)
     if not isinstance(numeric_level, int):
-        raise ValueError(f'Invalid log level: {args.log_level}')
+        parser.error(f'Invalid log level: {args.log_level}')
     logging.getLogger().setLevel(numeric_level)
 
     generator = PedestalGenerator(args)
