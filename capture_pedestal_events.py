@@ -335,6 +335,10 @@ class PedestalGenerator:
             q.boardloc = (self.site_info['module_id'] << 2) | idx
 
     def _init_quabos(self):
+        """
+        Initializes QuaboClient objects. NOTE: Hostname resolution is performed
+        synchronously here, which is acceptable during startup before the loop.
+        """
         clients = []
         if self.args.quabos:
             for i, q_str in enumerate(self.args.quabos):
@@ -408,53 +412,6 @@ class PedestalGenerator:
                 self.logger.error(f"Disk writer error: {e}")
             finally:
                 self._write_queue.task_done()
-
-    def _init_quabos(self):
-        """
-        Initializes QuaboClient objects. NOTE: Hostname resolution is performed
-        synchronously here, which is acceptable during startup before the loop.
-        """
-        clients = []
-        if self.args.quabos:
-            for i, q_str in enumerate(self.args.quabos):
-                if ':' in q_str:
-                    host, port_str = q_str.rsplit(':', 1)
-                    try:
-                        port = int(port_str)
-                    except ValueError:
-                        host, port = q_str, 60000
-                else:
-                    host, port = q_str, 60000
-                
-                # Resolve hostname to IP to ensure QuaboManager matching works
-                try:
-                    resolved_ip = socket.gethostbyname(host)
-                    self.logger.info(f"Resolved {host} to {resolved_ip}")
-                except socket.gaierror:
-                    self.logger.error(f"Could not resolve hostname: {host}")
-                    resolved_ip = host
-                
-                clients.append(QuaboClient(resolved_ip, port, i))
-        else:
-            base_ip = self.site_info['base_ip']
-            for i in range(4):
-                if self.site_info.get('use_ports'):
-                    ip, port = base_ip, 60000 + i
-                else:
-                    ip_parts = base_ip.split('.')
-                    ip_parts[-1] = str(int(ip_parts[-1]) + i)
-                    ip, port = '.'.join(ip_parts), 60000
-                clients.append(QuaboClient(ip, port, i))
-        return clients
-
-    def _validate_quabos(self):
-        """Ensures all quabos have unique (IP, Port) pairs."""
-        addrs = set()
-        for q in self.quabos:
-            addr = (q.ip, q.port)
-            if addr in addrs:
-                raise ValueError(f"Duplicate quabo address identified: {addr}")
-            addrs.add(addr)
 
     def _enqueue_item(self, item):
         """
