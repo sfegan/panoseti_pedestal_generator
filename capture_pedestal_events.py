@@ -41,6 +41,7 @@ _SCIENCE_LEN    = 528 # 16 + 512
 
 # EPB alignment: must be 32-bit (4-byte) aligned.
 _PAD_LEN        = (4 - (_CAPTURE_LEN % 4)) % 4
+_EPB_PAD        = b'\x00' * _PAD_LEN
 _EPB_TOTAL_LEN  = 32 + _CAPTURE_LEN + _PAD_LEN + 4
 
 _EPB_HDR_FORMAT = '<IIIIIII'
@@ -62,10 +63,11 @@ def calculate_checksum(data_list):
     s = 0
     for data in data_list:
         if len(data) % 2 == 1:
-            data += b'\x00'
-        for i in range(0, len(data), 2):
-            w = (data[i] << 8) + (data[i+1])
-            s += w
+            data = bytes(data) + b'\x00'
+        # Highly optimized via C-level struct unpacking
+        num_words = len(data) // 2
+        words = struct.unpack(f'!{num_words}H', data)
+        s += sum(words)
     
     while (s >> 16):
         s = (s & 0xFFFF) + (s >> 16)
@@ -77,7 +79,9 @@ def calculate_udp_checksum(src_ip, dst_ip, udp_hdr_no_cksum, payload):
                              socket.inet_aton(src_ip),
                              socket.inet_aton(dst_ip),
                              0, 17, len(udp_hdr_no_cksum) + len(payload))
-    return calculate_checksum([pseudo_hdr, udp_hdr_no_cksum, payload])
+    cksum = calculate_checksum([pseudo_hdr, udp_hdr_no_cksum, payload])
+    # RFC 768: If computed checksum is 0, transmit as 0xffff (all ones)
+    return cksum if cksum != 0 else 0xffff
 
 # Site configuration
 SITES = {
@@ -230,12 +234,14 @@ class QuaboManager(asyncio.DatagramProtocol):
         None means timeout, cancel, or send error.
         """
         # Create a single list of tasks. None values from send_all are 
-        # converted to dummy coroutines that return None.
+        # converted to pre-completed futures that return None.
+        loop = asyncio.get_event_loop()
         tasks = []
         for fut in futures:
             if fut is None:
-                async def _none(): return None
-                tasks.append(_none())
+                dummy_fut = loop.create_future()
+                dummy_fut.set_result(None)
+                tasks.append(dummy_fut)
             else:
                 tasks.append(fut)
 
@@ -292,9 +298,11 @@ class PedestalGenerator:
         self.buffer_max = args.buffer
         self.buffer = bytearray(_EPB_TOTAL_LEN * self.buffer_max)
 
-        # Producer-consumer write queue. Bounded to avoid runaway memory if
-        # the writer thread falls behind.
-        self._write_queue = asyncio.Queue(maxsize=100)
+        # Producer-consumer write queue.
+        # We use an unbounded queue but manually cap pending data items to 100 to avoid runaway memory,
+        # which guarantees critical commands (ROLLOVER, SHUTDOWN) are never dropped.
+        self._write_queue = asyncio.Queue()
+        self._pending_data_count = 0
         self._writer_task = None
         self._watchdog_task = None
 
@@ -396,6 +404,8 @@ class PedestalGenerator:
                 break
                 
             cmd, payload = item
+            if cmd == "DATA":
+                self._pending_data_count -= 1
             try:
                 if cmd == "DATA" and current_writer:
                     data, count = payload
@@ -418,26 +428,14 @@ class PedestalGenerator:
         Non-blocking enqueue for commands and data.
         Only "DATA" items are eligible for dropping during queue overflows.
         """
-        try:
-            self._write_queue.put_nowait(item)
-        except asyncio.QueueFull:
-            if item[0] != "DATA":
-                # Critical commands (ROLLOVER, SHUTDOWN) must not be dropped.
-                # Use a background task to ensure they are eventually processed.
-                self.logger.warning(f"Write queue full — enqueuing critical command {item[0]} in background")
-                asyncio.create_task(self._write_queue.put(item))
+        cmd, payload = item
+        if cmd == "DATA":
+            if self._pending_data_count >= 100:
+                self.logger.warning("Write queue full — dropping incoming DATA item to protect timing")
                 return
-
-            self.logger.warning("Write queue full — dropping oldest DATA item to protect timing")
-            try:
-                self._write_queue.get_nowait()
-                self._write_queue.task_done()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                self._write_queue.put_nowait(item)
-            except asyncio.QueueFull:
-                self.logger.error("Write queue still full after drop — item lost")
+            self._pending_data_count += 1
+            
+        self._write_queue.put_nowait(item)
     def _write_pcap(self, q_idx, pixel_data, ts_tai, nanosec, ts_utc):
         """
         Assembles a full Pcapng EPB (including Network and Science headers)
@@ -487,7 +485,7 @@ class PedestalGenerator:
             self.buffer[sci_ptr+16:sci_ptr+528] = pixel_data
         
         # 5. EPB Padding and Footer
-        self.buffer[ptr+32+_CAPTURE_LEN:ptr+32+_CAPTURE_LEN+_PAD_LEN] = b'\x00' * _PAD_LEN
+        self.buffer[ptr+32+_CAPTURE_LEN:ptr+32+_CAPTURE_LEN+_PAD_LEN] = _EPB_PAD
         struct.pack_into(_EPB_FTR_FORMAT, self.buffer, ptr+_EPB_TOTAL_LEN-4, _EPB_TOTAL_LEN)
         
         self.buffer_ptr += _EPB_TOTAL_LEN
