@@ -462,17 +462,23 @@ class PedestalGenerator:
 
         # Create the initial pcap file immediately
         await self._manage_rollover(wall_epoch)
-            
+        
+        period = 1 / self.args.frequency
         try:
             while True:
-                trigger_wall = wall_epoch + (slot + 0.5) / self.args.frequency
-                trigger_mono = mono_epoch + (slot + 0.5) / self.args.frequency
+                trigger_wall = wall_epoch + (slot + 0.5) * period
+                trigger_mono = mono_epoch + (slot + 0.5) * period
 
                 sleep_dur = trigger_mono - time.monotonic()
+                while sleep_dur < -0.1: #* self.args.frequency < -0.2:
+                    self.log("warning", f"Cycle {slot} is late by {-sleep_dur:.4f}s .. dropping to catch up")
+                    slot += 1
+                    self.cycle_count += 1                    
+                    trigger_wall += period
+                    trigger_mono += period
+                    sleep_dur += 1 / self.args.frequency
                 if sleep_dur > 0:
                     await asyncio.sleep(sleep_dur)
-                elif sleep_dur < -0.1:
-                    self.log("warning", f"Cycle {slot} is late by {-sleep_dur:.3f}s")
 
                 self.log("debug", f"Starting cycle {slot}, target trigger time: {trigger_wall:.3f}")
                 
