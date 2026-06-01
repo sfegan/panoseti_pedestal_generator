@@ -92,7 +92,7 @@ SITES = {
         'module_id': 0,
         'scope': 'Emulator',
         'use_ports': True
-    }
+    },
 }
 
 class PcapngWriter:
@@ -272,15 +272,36 @@ class PedestalGenerator:
 
     def _init_quabos(self):
         clients = []
-        base_ip = self.site_info['base_ip']
-        for i in range(4):
-            if self.site_info.get('use_ports'):
-                ip, port = base_ip, 60000 + i
-            else:
-                ip_parts = base_ip.split('.')
-                ip_parts[-1] = str(int(ip_parts[-1]) + i)
-                ip, port = '.'.join(ip_parts), 60000
-            clients.append(QuaboClient(ip, port, i))
+        if self.args.quabos:
+            for i, q_str in enumerate(self.args.quabos):
+                if ':' in q_str:
+                    host, port_str = q_str.rsplit(':', 1)
+                    try:
+                        port = int(port_str)
+                    except ValueError:
+                        host, port = q_str, 60000
+                else:
+                    host, port = q_str, 60000
+                
+                # Resolve hostname to IP to ensure QuaboManager matching works
+                try:
+                    resolved_ip = socket.gethostbyname(host)
+                    self.log("info", f"Resolved {host} to {resolved_ip}")
+                except socket.gaierror:
+                    self.log("error", f"Could not resolve hostname: {host}")
+                    resolved_ip = host
+                
+                clients.append(QuaboClient(resolved_ip, port, i))
+        else:
+            base_ip = self.site_info['base_ip']
+            for i in range(4):
+                if self.site_info.get('use_ports'):
+                    ip, port = base_ip, 60000 + i
+                else:
+                    ip_parts = base_ip.split('.')
+                    ip_parts[-1] = str(int(ip_parts[-1]) + i)
+                    ip, port = '.'.join(ip_parts), 60000
+                clients.append(QuaboClient(ip, port, i))
         return clients
 
     def _validate_quabos(self):
@@ -345,7 +366,7 @@ class PedestalGenerator:
             else:
                 miss_str = f"missing packets - {', '.join(miss_reports)}"
                 
-            stats_msg = f"Last 60s: {self.generated_since_last_report} pedestals generated, {miss_str}"
+            stats_msg = f"Last 60s: {self.generated_since_last_report} pedestal events generated, {miss_str}"
             self.log("info", stats_msg)
             
             # Reset delta stats
@@ -400,6 +421,8 @@ class PedestalGenerator:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 await self._manage_rollover(int(ts_utc))
+                self.total_generated += 1
+                self.generated_since_last_report += 1
 
                 responses_this_cycle = 0
                 for idx, data in enumerate(results):
@@ -427,8 +450,6 @@ class PedestalGenerator:
                             self.site_info['daq_ip'], 60001, 60001
                         )
                         await self._write_pcap_async(full_packet, int(ts_utc), nanosec)
-                        self.total_generated += 1
-                        self.generated_since_last_report += 1
                     else:
                         self.log("debug", f"Quabo {idx} timeout waiting for response")
                         q.total_missing += 1
@@ -438,7 +459,7 @@ class PedestalGenerator:
                             self.log("warning", f"Quabo {idx} at {q.ip} is not responding (5 consecutive misses). It might be down.")
                             q.is_down = True
                 
-                if responses_this_cycle > 0 and self.total_generated <= 4:
+                if responses_this_cycle > 0 and self.total_generated <= 1:
                     self.log("info", f"Received first {responses_this_cycle} responses from quabos.")
                 
                 self.cycle_count += 1
@@ -469,6 +490,7 @@ async def main():
     parser.add_argument('--buffer', type=int, default=100, help='Number of packets to buffer before writing to disk. Higher values increase efficiency but risk losing data on crash.')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--timeout', type=float, default=None, help='UDP response timeout in seconds (default: 0.5/frequency)')
+    parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
     args = parser.parse_args()
 
     numeric_level = getattr(logging, args.log_level.upper(), None)

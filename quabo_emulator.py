@@ -52,7 +52,7 @@ class QuaboEmulatorProtocol(asyncio.DatagramProtocol):
         pixel_data = struct.pack('<256h', *pixels)
         self.transport.sendto(header + pixel_data, addr)
 
-async def run_emulator(quabo_id, port, delay, drop_prob):
+async def run_emulator(quabo_id, bind_ip, port, delay, drop_prob):
     # Initialize 256 channels with random mean (0-10) and variance (10-20)
     means = [random.uniform(0, 10) for _ in range(256)]
     variances = [random.uniform(10, 20) for _ in range(256)]
@@ -60,9 +60,9 @@ async def run_emulator(quabo_id, port, delay, drop_prob):
     loop = asyncio.get_event_loop()
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: QuaboEmulatorProtocol(quabo_id, means, variances, delay, drop_prob),
-        local_addr=('127.0.0.1', port)
+        local_addr=(bind_ip, port)
     )
-    print(f"Quabo {quabo_id} emulator listening on 127.0.0.1:{port} (delay={delay}s, drop_prob={drop_prob})")
+    print(f"Quabo {quabo_id} emulator listening on {bind_ip}:{port} (delay={delay}s, drop_prob={drop_prob})")
     
     try:
         while True:
@@ -71,14 +71,14 @@ async def run_emulator(quabo_id, port, delay, drop_prob):
         transport.close()
 
 async def main(args):
-    # Start 4 emulators for ports 60000 to 60003
+    # Start emulators
     tasks = []
     disabled_ids = set(args.disable)
-    for i in range(4):
+    for i in range(args.num_quabos):
         if i in disabled_ids:
             print(f"Quabo {i} is DISABLED.")
             continue
-        tasks.append(run_emulator(i, 60000 + i, args.delay, args.drop_prob))
+        tasks.append(run_emulator(i, args.bind, args.base_port + i, args.delay, args.drop_prob))
     
     await asyncio.gather(*tasks)
 
@@ -87,6 +87,9 @@ if __name__ == "__main__":
     parser.add_argument('--delay', type=float, default=0.001, help='Response delay in seconds')
     parser.add_argument('--disable', type=int, nargs='*', default=[], help='List of quabo IDs (0-3) to disable')
     parser.add_argument('--drop-prob', type=float, default=0.0, help='Probability of dropping a packet (0.0 to 1.0)')
+    parser.add_argument('--base-port', type=int, default=60000, help='Base UDP port for emulators')
+    parser.add_argument('--num-quabos', type=int, default=4, help='Number of quabos to emulate')
+    parser.add_argument('--bind', default='0.0.0.0', help='IP address to bind to')
     args = parser.parse_args()
 
     if hasattr(asyncio, 'run'):
