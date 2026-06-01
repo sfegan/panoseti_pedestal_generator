@@ -53,11 +53,11 @@ def repack_science_packet(pixel_data, packet_no, boardloc, tai_seconds, nanoseco
     - Offset 4 (2B): boardloc (16-bit location ID: bits 15:8=Aperture, 1:0=Quadrant)
     - Offset 6 (4B): TAI (32-bit seconds since epoch)
     - Offset 10 (4B): NANOSEC (32-bit nanoseconds since last tick)
-    - Offset 14 (2B): unused (Reserved)
+    - Offset 14 (2B): flags (Bit 0 = SW-triggered event)
     """
     header = struct.pack('<BBHHIIH', 
                          0x01, 1, packet_no, boardloc, 
-                         tai_seconds, nanoseconds, 0)
+                         tai_seconds, nanoseconds, 1)
     return header + pixel_data
 
 # Site configuration
