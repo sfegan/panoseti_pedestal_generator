@@ -247,7 +247,7 @@ class QuaboManager(asyncio.DatagramProtocol):
         """
         # Create a single list of tasks. None values from send_all are 
         # converted to pre-completed futures that return None.
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         tasks = []
         for fut in futures:
             if fut is None:
