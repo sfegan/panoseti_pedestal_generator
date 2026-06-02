@@ -44,15 +44,27 @@ logger = logging.getLogger('capture_pedestals')
 MAX_FREQUENCY = 1000   # Hard upper limit (Hz)
 MIN_TIMEOUT   = 0.002  # Hard lower limit on auto-computed timeout (seconds)
 
-# Constants for Zero-Join Buffer (Pcapng EPB + Ethernet + IP + UDP + Science + Payload)
-# Ethernet(14) + IP(20) + UDP(8) + Science(16) + Payload(512) = 570 bytes.
-_CAPTURE_LEN    = 570
-_SCIENCE_LEN    = 528 # 16 + 512
+# --- Packet and Protocol Format Constants ---
+_ETH_HDR_LEN    = 14
+_IP_HDR_LEN     = 20
+_UDP_HDR_LEN    = 8
+_SCI_HDR_LEN    = 16
+_PIXEL_DATA_LEN = 512
+
+# Pcapng structural constants
+_EPB_HDR_LEN    = 28
+_EPB_FTR_LEN    = 4
+
+# Derived lengths for Pcapng and Zero-Join Buffer
+_ETH_IP_LEN     = _ETH_HDR_LEN + _IP_HDR_LEN # 34
+_NET_HDR_LEN    = _ETH_IP_LEN + _UDP_HDR_LEN  # 42
+_SCIENCE_LEN    = _SCI_HDR_LEN + _PIXEL_DATA_LEN # 528
+_CAPTURE_LEN    = _NET_HDR_LEN + _SCIENCE_LEN    # 570
 
 # EPB alignment: must be 32-bit (4-byte) aligned.
 _PAD_LEN        = (4 - (_CAPTURE_LEN % 4)) % 4
 _EPB_PAD        = b'\x00' * _PAD_LEN
-_EPB_TOTAL_LEN  = 28 + _CAPTURE_LEN + _PAD_LEN + 4
+_EPB_TOTAL_LEN  = _EPB_HDR_LEN + _CAPTURE_LEN + _PAD_LEN + _EPB_FTR_LEN
 
 _EPB_HDR_FORMAT = '<IIIIIII'
 _EPB_FTR_FORMAT = '<I'
@@ -64,9 +76,9 @@ _SCIENCE_HDR_FORMAT = '<BBHHIIH'
 # Built once at import time so struct.pack() is never called in the hot path.
 _TRIGGER_CMD = struct.pack('B', 0x0c) + b'\x00' * 63
 
-# Payload size constants for science packet extraction
-_PKT_HEADER_OFFSET = 4    # bytes to skip at start of raw quabo response
-_PKT_PAYLOAD_END   = 516  # end of the 512-byte pixel payload
+# Payload size constants for science packet extraction from raw QUABO response
+_PKT_HEADER_OFFSET = 4
+_PKT_PAYLOAD_END   = _PKT_HEADER_OFFSET + _PIXEL_DATA_LEN # 516
 
 def calculate_checksum(data_list):
     """Calculates the 16-bit one's complement sum over a list of buffers."""
@@ -74,7 +86,8 @@ def calculate_checksum(data_list):
     for data in data_list:
         if len(data) % 2 == 1:
             data = bytes(data) + b'\x00'
-        # Highly optimized via C-level struct unpacking
+        # Fast C-level struct unpacking; note: 'H' is endian-dependent but 
+        # compensated for by htons() for standard network-order (big-endian) checksums.
         words = array.array('H')
         words.frombytes(data)
         s += sum(words)
@@ -329,7 +342,7 @@ class PedestalGenerator:
             eth = struct.pack('!6s6sH', b'\x00'*6, b'\x00'*6, 0x0800)
             
             # IP (20B)
-            total_len = 20 + 8 + _SCIENCE_LEN
+            total_len = _IP_HDR_LEN + _UDP_HDR_LEN + _SCIENCE_LEN
             ip_no_cksum = struct.pack('!BBHHHBBH4s4s', 
                                       0x45, 0, total_len, 0, 0x4000, 64, 17, 0, 
                                       socket.inet_aton(q.ip), socket.inet_aton(self.site_info['daq_ip']))
@@ -346,7 +359,7 @@ class PedestalGenerator:
             # If checksums are enabled, we can't pre-calculate the full UDP header because 
             # the checksum depends on the payload (which contains variable timestamps).
             # We'll pre-pack the first 6 bytes and handle the checksum in the hot path.
-            q.udp_hdr_base = struct.pack('!HHH', 60001, 60001, 8 + _SCIENCE_LEN)
+            q.udp_hdr_base = struct.pack('!HHH', 60001, 60001, _UDP_HDR_LEN + _SCIENCE_LEN)
             
             if not self.args.compute_checksums:
                 # Full static header possible if no checksums
@@ -478,27 +491,27 @@ class PedestalGenerator:
         # 2. Network Header (Eth + IP + UDP)
         if not self.args.compute_checksums:
             # Full static header (42B)
-            self.buffer[ptr+28:ptr+70] = q.precalculated_net_hdr
-            sci_ptr = ptr + 70
+            self.buffer[ptr+_EPB_HDR_LEN:ptr+_EPB_HDR_LEN+_NET_HDR_LEN] = q.precalculated_net_hdr
+            sci_ptr = ptr + _EPB_HDR_LEN + _NET_HDR_LEN
         else:
             # Static Eth + IP (34B)
-            self.buffer[ptr+28:ptr+62] = q.precalculated_net_hdr
+            self.buffer[ptr+_EPB_HDR_LEN:ptr+_EPB_HDR_LEN+_ETH_IP_LEN] = q.precalculated_net_hdr
             
             # 3. Science Header (16B) - written early for checksumming
-            sci_ptr = ptr + 70
+            sci_ptr = ptr + _EPB_HDR_LEN + _NET_HDR_LEN
             struct.pack_into(_SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
                              0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
             
             # 4. Pixel Data (512B) - written early for checksumming
-            self.buffer[sci_ptr+16:sci_ptr+528] = pixel_data
+            self.buffer[sci_ptr+_SCI_HDR_LEN:sci_ptr+_SCI_HDR_LEN+_PIXEL_DATA_LEN] = pixel_data
             
             # Calculate UDP checksum using a memoryview of the assembled payload
-            payload_view = memoryview(self.buffer)[sci_ptr:sci_ptr+528]
+            payload_view = memoryview(self.buffer)[sci_ptr:sci_ptr+_SCIENCE_LEN]
             udp_cksum = calculate_udp_checksum(q.ip, self.site_info['daq_ip'], q.udp_hdr_base + b'\x00\x00', payload_view)
             
             # UDP Header (8B)
-            self.buffer[ptr+62:ptr+68] = q.udp_hdr_base
-            struct.pack_into('!H', self.buffer, ptr+68, udp_cksum)
+            self.buffer[ptr+_EPB_HDR_LEN+_ETH_IP_LEN:ptr+_EPB_HDR_LEN+_ETH_IP_LEN+6] = q.udp_hdr_base
+            struct.pack_into('!H', self.buffer, ptr+_EPB_HDR_LEN+_ETH_IP_LEN+6, udp_cksum)
 
         if not self.args.compute_checksums:
             # 3. Science Header (16B)
@@ -506,10 +519,10 @@ class PedestalGenerator:
                              0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
             
             # 4. Pixel Data (512B)
-            self.buffer[sci_ptr+16:sci_ptr+528] = pixel_data
+            self.buffer[sci_ptr+_SCI_HDR_LEN:sci_ptr+_SCI_HDR_LEN+_PIXEL_DATA_LEN] = pixel_data
         
         # 5. EPB Padding and Footer
-        self.buffer[ptr+32+_CAPTURE_LEN:ptr+32+_CAPTURE_LEN+_PAD_LEN] = _EPB_PAD
+        self.buffer[ptr+_EPB_HDR_LEN+_CAPTURE_LEN:ptr+_EPB_HDR_LEN+_CAPTURE_LEN+_PAD_LEN] = _EPB_PAD
         struct.pack_into(_EPB_FTR_FORMAT, self.buffer, ptr+_EPB_TOTAL_LEN-4, _EPB_TOTAL_LEN)
         
         self.buffer_ptr += _EPB_TOTAL_LEN
@@ -703,8 +716,9 @@ class PedestalGenerator:
                             q.is_down = False
                         q.consecutive_misses = 0
 
-                        # Optimized in-place buffer assembly
-                        self._write_pcap(idx, data[_PKT_HEADER_OFFSET:_PKT_PAYLOAD_END], ts_tai, nanosec, ts_utc)
+                        # Optimized in-place buffer assembly using memoryview to avoid copies
+                        view = memoryview(data)[_PKT_HEADER_OFFSET:_PKT_PAYLOAD_END]
+                        self._write_pcap(idx, view, ts_tai, nanosec, ts_utc)
                     else:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.logger.debug(f"Quabo {idx} timeout waiting for response")
