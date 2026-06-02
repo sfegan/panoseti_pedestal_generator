@@ -11,9 +11,9 @@
 import asyncio
 import struct
 import random
-import time
 import datetime
 import argparse
+import math
 
 class QuaboEmulatorProtocol(asyncio.DatagramProtocol):
     def __init__(self, quabo_id, means, variances, delay=0.1, drop_prob=0.0):
@@ -53,7 +53,7 @@ class QuaboEmulatorProtocol(asyncio.DatagramProtocol):
         # Generate 256 Gaussian values
         pixels = []
         for m, s in zip(self.means, self.stds):
-            val = int(random.gauss(m, s))
+            val = int(math.floor(random.gauss(m, s) + 0.5))
             val = max(-32768, min(32767, val))
             pixels.append(val)
         
