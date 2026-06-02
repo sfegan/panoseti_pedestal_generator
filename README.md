@@ -22,8 +22,14 @@ Pedestal events sample the baseline pixel amplitudes when no trigger is present.
 `capture_pedestal_events.py` polls a module of four Quabo boards (each processing 256 pixels), records the responses, and writes them to a `.pcapng` file for offline analysis. The script is designed to run at low frequencies during an observation, or at high frequencies (up to 1000 Hz) for dedicatedcalibration runs.
 
 ### 1. Timing and Scheduling
-The script uses a software-based phase-locked loop to schedule polling times relative to the system clock. Triggers are scheduled at:
-$$\text{Trigger Time} = \text{Epoch} + \frac{\text{Slot} + 0.5}{\text{Frequency}}$$
+
+The script uses a software-based phase-locked loop to schedule polling times relative to the system clock. It supports both high frequencies and fractional frequencies (periods > 1s). Triggers are scheduled at:
+$$\text{Trigger Time} = \text{Epoch} + (\text{Slot} \times \text{Period}) + \text{Offset}$$
+where:
+*   $\text{Period}$ is derived from `--frequency` (supports negative integers for $1/n$ Hz).
+*   $\text{Offset} = 0.5 \times \min(\text{Period}, 1.0)$.
+
+This ensures that for high frequencies, triggers occur in the middle of each time slot, while for fractional frequencies (periods $\ge 1$s), triggers are anchored at exactly $0.5$ seconds into the first second of the polling cycle.
 
 ### 2. UDP Polling
 In each cycle, the script sends the 64-byte software read command (`R_PH`: first byte `0x0c` followed by zeros) to the four configured quabo boards concurrently. It waits for responses from the quabos which contain the measured PH data. These are matched to pending requests using the quabo's `(IP, Port)` address and matched packets are given the same sequence number and event time for tracking. If a response is not received within the specified timeout, the quabo is marked as "dropped" for that cycle, which is logged in the diagnostics.
@@ -45,11 +51,11 @@ Raw response packets from the quabos contain a 4-byte header and 512 bytes of pi
 **Note:** I propose that the *Reserved* field be considered as a *Flags* field in the future, allowing for future expansion without breaking compatibility. Here I propose that bit 0 (LSB) be used to indicate whether the payload contains a software triggered event.
 
 ### 4. Ethernet/IP/UDP Encapsulation
-The 528-byte science payload is wrapped in mock network headers to match packets that have been captured with Wireshark (Total size: 570 bytes):
+The 528-byte science payload is wrapped in mock network headers to match packets that have been captured with Wireshark (Total size: 570 bytes).
 * **Ethernet II Header** (14 bytes): Source/Dest MAC set to zero. EtherType `0x0800`.
 * **IPv4 Header** (20 bytes): Quabo IP as source, DAQ IP as destination.
 * **UDP Header** (8 bytes): Port `60001` for source and destination.
-* **Checksums**: By default, IP and UDP checksums are set to zero for maximum performance. Full checksum calculation can be enabled via `--compute_checksums`.
+* **Checksums**: By default, IP and UDP checksums are set to zero. Full checksum calculation can be enabled via `--compute-checksums`.
 
 ### 5. PCAPNG file output (`PcapngWriter`)
 To emulate the handling of the science packets from normal, triggered events, the pedestal packets are written to a `.pcapng` file using the internal `PcapngWriter` class, which handles writing the various PCAPNG header blocks. The output file is named according to the template specified by `--output` (default: `pedestals_{scope}_{date}_{time}.pcapng`), where:
@@ -90,15 +96,15 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 | Argument | Shorthand | Type | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `--site` | `-s` | *String* | **Required** | Preset choice (`gattini`, `winter`, `fern`, `pti`, `localhost`) |
-| `--frequency` | | *Int* | `1` | Polling frequency in Hz (max 1000) |
+| `--frequency` | | *Int* | `1` | Frequency in Hz (-1000-1000). Use negative integers for $1/n$ Hz (e.g. `-2` = 0.5 Hz). |
 | `--rollover` | | *Int* | `600` | Rollover interval in seconds (0 to disable) |
 | `--output` | `-o` | *String* | `pedestals_{scope}_{date}_{time}.pcapng` | Output path template |
 | `--tai-offset` | | *Int* | `37` | TAI offset from UTC in seconds |
 | `--bind-port` | | *Int* | `0` | Local port to bind (0 for random) |
-| `--buffer` | | *Int* | *Dynamic* | Packets to buffer before write (Default: frequency, clamped 60-1000) |
-| `--checksums` | | *Flag* | `False` | Enable IP/UDP checksum calculation (CPU intensive) |
+| `--buffer` | | *Int* | *Dynamic* | Packets to buffer before write (Default: 60 or frequency) |
+| `--compute-checksums` | | *Flag* | `False` | Enable IP/UDP checksum calculation |
 | `--log-level` | | *String* | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `--timeout` | | *Float* | `None` | UDP timeout in seconds (default: $0.5 / \text{frequency}$) |
+| `--timeout` | | *Float* | `None` | UDP timeout in seconds (default: $0.5 \times \min(\text{Period}, 1.0)$) |
 | `--quabos` | | *List* | `None` | Overrides site defaults with specific `host[:port]` |
 
 ---
