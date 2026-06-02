@@ -317,6 +317,7 @@ class PedestalGenerator:
         self._pending_data_count = 0
         self._writer_task = None
         self._watchdog_task = None
+        self._writer_failed = False
 
     def _precalculate_headers(self):
         """Pre-calculates static Ethernet/IP/UDP headers for each quabo."""
@@ -428,8 +429,13 @@ class PedestalGenerator:
                         await loop.run_in_executor(self.executor, current_writer.close)
                         current_writer = None
                     # Open the new file safely in the background thread
-                    current_writer = await loop.run_in_executor(self.executor, PcapngWriter, payload)
-                    self.logger.info(f"Opened {current_writer.filename}")
+                    try:
+                        current_writer = await loop.run_in_executor(self.executor, PcapngWriter, payload)
+                        self.logger.info(f"Opened {current_writer.filename}")
+                    except Exception as e:
+                        self.logger.critical(f"Failed to open output file {payload}: {e}. Stopping data capture.")
+                        self._writer_failed = True
+                        break
             except Exception as e:
                 self.logger.error(f"Disk writer error: {e}")
             finally:
@@ -445,9 +451,9 @@ class PedestalGenerator:
             if self._pending_data_count >= 100:
                 self.logger.warning("Write queue full — dropping incoming DATA item to protect timing")
                 return
-            self._pending_data_count += 1
-            
+            self._pending_data_count += 1            
         self._write_queue.put_nowait(item)
+
     def _write_pcap(self, q_idx, pixel_data, ts_tai, nanosec, ts_utc):
         """
         Assembles a full Pcapng EPB (including Network and Science headers)
@@ -627,6 +633,11 @@ class PedestalGenerator:
         period = 1 / self.args.frequency
         try:
             while True:
+                # Check if the writer task has encountered a critical failure
+                if self._writer_failed:
+                    self.logger.info("Writer task failed — stopping capture.")
+                    break
+                
                 trigger_wall = wall_epoch + (slot + 0.5) / self.args.frequency
                 trigger_mono = mono_epoch + (slot + 0.5) * period
 
@@ -721,6 +732,13 @@ class PedestalGenerator:
                 except asyncio.TimeoutError:
                     self.logger.error("Writer task did not finish in time — some data may be lost")
                     self._writer_task.cancel()
+                
+                # Clean up the watchdog task (only await if loop is actually running)
+                self._watchdog_task.cancel()
+                try:
+                    await self._watchdog_task
+                except asyncio.CancelledError:
+                    pass
             else:
                 # Emergency Fallback: The loop is already dead/closing.
                 # Since we're outside the async context, we can't await, but we should still
@@ -732,19 +750,11 @@ class PedestalGenerator:
                     self.logger.warning(f"Fallback flushing {self.buffer_count} packets to pending queue before executor shutdown...")
                     # Enqueue the buffered data one last time. The executor.shutdown(wait=True) 
                     # below will ensure any in-flight writes complete before we exit.
-                    try:
-                        self._write_queue.put_nowait(("DATA", (data, self.buffer_count)))
-                    except asyncio.QueueFull:
-                        self.logger.error(f"Could not enqueue final {self.buffer_count} packets — data loss imminent")
+                    self._write_queue.put_nowait(("DATA", (data, self.buffer_count)))
                 
+                # Cancel tasks (no awaits—loop is dead)
                 self._writer_task.cancel()
-
-            # Clean up the watchdog task
-            self._watchdog_task.cancel()
-            try:
-                await self._watchdog_task
-            except (asyncio.CancelledError, RuntimeError):
-                pass
+                self._watchdog_task.cancel()
 
             if self.transport:
                 self.transport.close()
