@@ -96,6 +96,19 @@ SITES = {
     },
 }
 
+###################################################################################################
+#
+#    8888888b.   .d8888b.        d8888 8888888b.  
+#    888   Y88b d88P  Y88b      d88888 888   Y88b 
+#    888    888 888    888     d88P888 888    888 
+#    888   d88P 888           d88P 888 888   d88P 
+#    8888888P"  888          d88P  888 8888888P"  
+#    888        888    888  d88P   888 888        
+#    888        Y88b  d88P d8888888888 888        
+#    888         "Y8888P" d88P     888 888        
+#
+###################################################################################################
+
 class PcapngWriter(DataWriter):
     """
     Self-contained Pcapng writer with background I/O, buffering, and rollover.
@@ -168,7 +181,7 @@ class PcapngWriter(DataWriter):
         self.rollover = rollover
         self.buffer_max = buffer
         self.compute_checksums = compute_checksums
-        self.logger = logger
+        self.logger = logging.LoggerAdapter(logger, {'scope': f"{scope}] [PCAP"})
 
         # Internal state
         self.last_rollover_sec = 0
@@ -447,6 +460,19 @@ class PcapngWriter(DataWriter):
             # We must shutdown the executor here to at least try to flush.
             self.executor.shutdown(wait=True)
 
+###################################################################################################
+#
+#    8888888b.  8888888888 8888888888 
+#    888   Y88b 888        888        
+#    888    888 888        888        
+#    888   d88P 8888888    8888888    
+#    8888888P"  888        888        
+#    888        888        888        
+#    888        888        888        
+#    888        888        888        
+#
+###################################################################################################
+
 class PffWriter(DataWriter):
     def __init__(self, template: str, scope: str, max_size_mb: int, logger) -> None:
         self.template = template
@@ -459,6 +485,20 @@ class PffWriter(DataWriter):
 
     def close(self) -> None:
         pass
+
+###################################################################################################
+#
+#     .d88888b.                    888               
+#    d88P" "Y88b                   888               
+#    888     888                   888               
+#    888     888 888  888  8888b.  88888b.   .d88b.  
+#    888     888 888  888     "88b 888 "88b d88""88b 
+#    888 Y8b 888 888  888 .d888888 888  888 888  888 
+#    Y88b.Y8b88P Y88b 888 888  888 888 d88P Y88..88P 
+#     "Y888888"   "Y88888 "Y888888 88888P"   "Y88P"  
+#           Y8b                                      
+#                                                    
+###################################################################################################
 
 class QuaboManager(asyncio.DatagramProtocol):
     """Manages a single persistent UDP socket for all quabos."""
@@ -520,26 +560,42 @@ class QuaboManager(asyncio.DatagramProtocol):
         # Create a single list of tasks. None values from send_all are 
         # converted to pre-completed futures that return None.
         loop = asyncio.get_event_loop()
-        tasks = []
+        task_list = []
         for fut in futures:
             if fut is None:
                 dummy_fut = loop.create_future()
                 dummy_fut.set_result(None)
-                tasks.append(dummy_fut)
+                task_list.append(dummy_fut)
             else:
-                tasks.append(fut)
+                task_list.append(fut)
 
-        try:
-            # Parallel wait for all responses with one global timeout
-            return await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-        except asyncio.TimeoutError:
-            # On timeout, cancel all pending futures and return None for everything
-            for fut in futures:
-                if fut and not fut.done():
-                    fut.cancel()
-            return [None] * len(futures)
-        except Exception:
-            return [None] * len(futures)
+        # Parallel wait for all responses with one global timeout
+        done, pending = await asyncio.wait(
+            task_list,
+            timeout=timeout
+        )
+
+        results = [None] * len(task_list)
+        for idx, fut in enumerate(task_list):
+            if fut in done:
+                try:
+                    value = fut.result()
+                    if isinstance(value, Exception):
+                        results[idx] = None
+                    else:
+                        results[idx] = value
+                except Exception:
+                    results[idx] = None
+            else:
+                # If not in done, it's either in pending or was cancelled/failed earlier
+                results[idx] = None
+
+        # Cancel any still-pending futures after the timeout expires
+        for fut in pending:
+            if not fut.done():
+                fut.cancel()
+
+        return results
 
 class QuaboClient:
     """Helper to track state for a single quabo board."""
@@ -554,6 +610,19 @@ class QuaboClient:
         self.misses_since_last_report = 0
         # Per-board first-response flag for startup confirmation logging
         self.first_response_logged = False
+
+###################################################################################################
+#
+#     .d8888b.                                             888                    
+#    d88P  Y88b                                            888                    
+#    888    888                                            888                    
+#    888         .d88b.  88888b.   .d88b.  888d888 8888b.  888888 .d88b.  888d888 
+#    888  88888 d8P  Y8b 888 "88b d8P  Y8b 888P"      "88b 888   d88""88b 888P"   
+#    888    888 88888888 888  888 88888888 888    .d888888 888   888  888 888     
+#    Y88b  d88P Y8b.     888  888 Y8b.     888    888  888 Y88b. Y88..88P 888     
+#     "Y8888P88  "Y8888  888  888  "Y8888  888    "Y888888  "Y888 "Y88P"  888     
+#
+###################################################################################################
 
 class PedestalGenerator:
     def __init__(self, args):
@@ -720,8 +789,8 @@ class PedestalGenerator:
                 self.logger.warning(f"Could not set UDP receive buffer: {e}")
 
         local_addr = self.transport.get_extra_info('sockname')
-        frequecy_string = f'1/{-self.args.frequency}' if self.args.frequency < -1 else f'{max(1,self.args.frequency)}'
-        self.logger.info(f"Starting pedestal capture at {frequecy_string} Hz")
+        frequency_string = f'1/{-self.args.frequency}' if self.args.frequency < -1 else f'{max(1,self.args.frequency)}'
+        self.logger.info(f"Starting pedestal capture at {frequency_string} Hz")
         self.logger.info(f"Bound to local UDP port {local_addr[1]}")
         
         # Start background tasks with proper handles for clean shutdown
