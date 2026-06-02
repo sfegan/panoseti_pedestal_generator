@@ -762,21 +762,8 @@ class PedestalGenerator:
                     self.transport.close()
             finally:
                 # Force the thread pool to finish any remaining disk writes before exiting.
-                # Use a watchdog thread with timeout to prevent indefinite hangs.
-                import threading
-                
-                def shutdown_executor():
-                    self.executor.shutdown(wait=True)
-                
-                shutdown_thread = threading.Thread(target=shutdown_executor, daemon=False)
-                shutdown_thread.start()
-                shutdown_thread.join(timeout=10.0)
-                
-                if shutdown_thread.is_alive():
-                    self.logger.warning("Executor shutdown timeout after 10s — forcing exit")
-                    self.executor.shutdown(wait=False)
-                else:
-                    self.logger.debug("Executor shutdown completed normally")
+                # This is guaranteed to run even if transport.close() or cleanup code raises.
+                self.executor.shutdown(wait=True)
 
 async def main():
     parser = argparse.ArgumentParser(description='PANOSETI Pedestal Capture')
