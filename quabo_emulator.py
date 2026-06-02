@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+
+# quabo_emulator.py: Emulates PANOSETI quabo boards by responding to software trigger commands
+#                             and returning Gaussian random pixel data.
+
+# Author: Stephen Fegan <sfegan@llr.in2p3.fr> (2026-05-30)
+# Laboratoire Leprince-Ringuet, CNRS/IN2P3, Ecole Polytechnique, Institut Polytechnique de Paris
+
+# AI usage: Gemini-CLI
+
 import asyncio
 import struct
 import random

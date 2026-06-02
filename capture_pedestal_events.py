@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
+
+# capture_pedestal_events.py: Captures pedestal events from PANOSETI quabo boards by sending software 
+#                             trigger commands at a specified frequency and recording their responses 
+#                             in Pcapng format.
+
+# Author: Stephen Fegan <sfegan@llr.in2p3.fr> (2026-05-30)
+# Laboratoire Leprince-Ringuet, CNRS/IN2P3, Ecole Polytechnique, Institut Polytechnique de Paris
+
+# AI usage: Gemini-CLI
+
 import asyncio
 import struct
 import time
 import datetime
 import argparse
-import os
 import socket
 import concurrent.futures
 import logging
+import array
 
 # Configure logging
 class ScopeFormatter(logging.Formatter):
@@ -42,7 +52,7 @@ _SCIENCE_LEN    = 528 # 16 + 512
 # EPB alignment: must be 32-bit (4-byte) aligned.
 _PAD_LEN        = (4 - (_CAPTURE_LEN % 4)) % 4
 _EPB_PAD        = b'\x00' * _PAD_LEN
-_EPB_TOTAL_LEN  = 32 + _CAPTURE_LEN + _PAD_LEN + 4
+_EPB_TOTAL_LEN  = 28 + _CAPTURE_LEN + _PAD_LEN + 4
 
 _EPB_HDR_FORMAT = '<IIIIIII'
 _EPB_FTR_FORMAT = '<I'
@@ -65,9 +75,8 @@ def calculate_checksum(data_list):
         if len(data) % 2 == 1:
             data = bytes(data) + b'\x00'
         # Highly optimized via C-level struct unpacking
-        num_words = len(data) // 2
-        words = struct.unpack(f'!{num_words}H', data)
-        s += sum(words)
+        words = array.array('H', data)
+        s = sum(words)
     
     while (s >> 16):
         s = (s & 0xFFFF) + (s >> 16)
@@ -319,7 +328,7 @@ class PedestalGenerator:
                                       socket.inet_aton(q.ip), socket.inet_aton(self.site_info['daq_ip']))
             
             ip_cksum = 0
-            if self.args.checksums:
+            if self.args.compute_checksums:
                 ip_cksum = calculate_checksum([ip_no_cksum])
                 
             ip_hdr = struct.pack('!BBHHHBBH4s4s', 
@@ -332,7 +341,7 @@ class PedestalGenerator:
             # We'll pre-pack the first 6 bytes and handle the checksum in the hot path.
             q.udp_hdr_base = struct.pack('!HHH', 60001, 60001, 8 + _SCIENCE_LEN)
             
-            if not self.args.checksums:
+            if not self.args.compute_checksums:
                 # Full static header possible if no checksums
                 udp_hdr = q.udp_hdr_base + b'\x00\x00'
                 q.precalculated_net_hdr = eth + ip_hdr + udp_hdr
@@ -452,16 +461,16 @@ class PedestalGenerator:
                          0x00000006, _EPB_TOTAL_LEN, 0, ts_high, ts_low, _CAPTURE_LEN, _CAPTURE_LEN)
         
         # 2. Network Header (Eth + IP + UDP)
-        if not self.args.checksums:
+        if not self.args.compute_checksums:
             # Full static header (42B)
-            self.buffer[ptr+32:ptr+74] = q.precalculated_net_hdr
-            sci_ptr = ptr + 74
+            self.buffer[ptr+28:ptr+70] = q.precalculated_net_hdr
+            sci_ptr = ptr + 70
         else:
             # Static Eth + IP (34B)
-            self.buffer[ptr+32:ptr+66] = q.precalculated_net_hdr
+            self.buffer[ptr+28:ptr+62] = q.precalculated_net_hdr
             
             # 3. Science Header (16B) - written early for checksumming
-            sci_ptr = ptr + 74
+            sci_ptr = ptr + 70
             struct.pack_into(_SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
                              0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
             
@@ -473,10 +482,10 @@ class PedestalGenerator:
             udp_cksum = calculate_udp_checksum(q.ip, self.site_info['daq_ip'], q.udp_hdr_base + b'\x00\x00', payload_view)
             
             # UDP Header (8B)
-            self.buffer[ptr+66:ptr+72] = q.udp_hdr_base
-            struct.pack_into('!H', self.buffer, ptr+72, udp_cksum)
+            self.buffer[ptr+62:ptr+68] = q.udp_hdr_base
+            struct.pack_into('!H', self.buffer, ptr+68, udp_cksum)
 
-        if not self.args.checksums:
+        if not self.args.compute_checksums:
             # 3. Science Header (16B)
             struct.pack_into(_SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
                              0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
@@ -681,25 +690,44 @@ class PedestalGenerator:
             # ----------------------------------------------------------------
             # Clean shutdown: flush remaining data, drain the queue, then close.
             # ----------------------------------------------------------------
-            self._flush_buffer_to_queue()
-
-            # Shutdown sentinel — _disk_writer exits after processing this
-            await self._write_queue.put(None)
-            try:
-                await asyncio.wait_for(self._writer_task, timeout=10.0)
-            except asyncio.TimeoutError:
-                self.logger.error("Writer task did not finish in time — some data may be lost")
+            loop = asyncio.get_running_loop()
+            
+            if loop.is_running():
+                # Normal Case: Schedule the flush safely via thread-safe call,
+                # then push the None sentinel to gracefully stop the disk writer.
+                loop.call_soon_threadsafe(self._flush_buffer_to_queue)
+                await self._write_queue.put(None)
+                
+                try:
+                    await asyncio.wait_for(self._writer_task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    self.logger.error("Writer task did not finish in time — some data may be lost")
+                    self._writer_task.cancel()
+            else:
+                # Emergency Fallback: The loop is already dead/closing.
+                # We bypass the queue entirely and force a raw write.
+                self.logger.warning("Event loop is not running during shutdown. Executing fallback direct flush...")
+                
+                if self.buffer_count > 0:
+                    data = bytes(self.buffer[:self.buffer_ptr])
+                    # If the loop is dead, we can't rely on the async writer task. 
+                    # We log it and let executor shutdown clean up any pending file threads.
+                    self.logger.warning(f"Bypassed queue: {self.buffer_count} packets remaining in memory buffer.")
+                
                 self._writer_task.cancel()
 
+            # Clean up the watchdog task
             self._watchdog_task.cancel()
             try:
                 await self._watchdog_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, RuntimeError):
                 pass
 
             if self.transport:
                 self.transport.close()
-            self.executor.shutdown(wait=False)
+                
+            # Force the thread pool to finish any remaining disk writes before exiting
+            self.executor.shutdown(wait=True)
 
 async def main():
     parser = argparse.ArgumentParser(description='PANOSETI Pedestal Capture')
@@ -710,7 +738,7 @@ async def main():
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--bind-port', type=int, default=0, help='Local UDP port to bind to (0 for random)')
     parser.add_argument('--buffer', type=int, default=None, help='Number of packets to buffer before writing to disk. Default: frequency (clamped 60–1000)')
-    parser.add_argument('--checksums', action='store_true', help='Enable IP and UDP checksum calculation (CPU intensive)')
+    parser.add_argument('--compute-checksums', action='store_true', help='Enable IP and UDP checksum calculation (CPU intensive)')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/frequency))')
     parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')

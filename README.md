@@ -4,6 +4,11 @@ This repository contains a tool to trigger and capture pedestal events from PANO
 - `capture_pedestal_events.py`: Polls detector boards (Quabos) for software-generated Pulse Height pedestals events, wraps the payloads in Ethernet/IP/UDP headers, and writes them to a `.pcapng` file.
 - `quabo_emulator.py`: Emulates four Quabo boards responding to SW PH trigger commands with normal-distributed random pixel values for testing.
 
+Author: Stephen Fegan <sfegan@llr.in2p3.fr> (2026-05-30)
+Laboratoire Leprince-Ringuet, CNRS/IN2P3, Ecole Polytechnique, Institut Polytechnique de Paris
+
+AI usage: Gemini-CLI
+
 ---
 
 ## Pedestal Events
