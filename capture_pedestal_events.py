@@ -2,7 +2,7 @@
 
 # capture_pedestal_events.py: Captures pedestal events from PANOSETI quabo boards by sending software 
 #                             trigger commands at a specified frequency and recording their responses 
-#                             in Pcapng format.
+#                             in PCAPNG and PFF format.
 
 # Author: Stephen Fegan <sfegan@llr.in2p3.fr> (2026-05-30)
 # Laboratoire Leprince-Ringuet, CNRS/IN2P3, Ecole Polytechnique, Institut Polytechnique de Paris
@@ -18,8 +18,16 @@ import socket
 import concurrent.futures
 import logging
 import array
+import abc
 
-# Configure logging
+class DataWriter(abc.ABC):
+    @abc.abstractmethod
+    def write_packet(self, q, pixel_data, ts_tai: int,
+                     nanosec: int, ts_utc: float, cycle_count: int) -> None: ...
+
+    @abc.abstractmethod
+    def close(self) -> None: ...
+
 class ScopeFormatter(logging.Formatter):
     """Custom formatter that ensures 'scope' always exists to avoid KeyErrors."""
     def format(self, record):
@@ -44,69 +52,14 @@ logger = logging.getLogger('capture_pedestals')
 MAX_FREQUENCY = 1000   # Hard upper limit (Hz)
 MIN_TIMEOUT   = 0.002  # Hard lower limit on auto-computed timeout (seconds)
 
-# --- Packet and Protocol Format Constants ---
-_ETH_HDR_LEN    = 14
-_IP_HDR_LEN     = 20
-_UDP_HDR_LEN    = 8
-_SCI_HDR_LEN    = 16
-_PIXEL_DATA_LEN = 512
-
-# Pcapng structural constants
-_EPB_HDR_LEN    = 28
-_EPB_FTR_LEN    = 4
-
-# Derived lengths for Pcapng and Zero-Join Buffer
-_ETH_IP_LEN     = _ETH_HDR_LEN + _IP_HDR_LEN # 34
-_NET_HDR_LEN    = _ETH_IP_LEN + _UDP_HDR_LEN  # 42
-_SCIENCE_LEN    = _SCI_HDR_LEN + _PIXEL_DATA_LEN # 528
-_CAPTURE_LEN    = _NET_HDR_LEN + _SCIENCE_LEN    # 570
-
-# EPB alignment: must be 32-bit (4-byte) aligned.
-_PAD_LEN        = (4 - (_CAPTURE_LEN % 4)) % 4
-_EPB_PAD        = b'\x00' * _PAD_LEN
-_EPB_TOTAL_LEN  = _EPB_HDR_LEN + _CAPTURE_LEN + _PAD_LEN + _EPB_FTR_LEN
-
-_EPB_HDR_FORMAT = '<IIIIIII'
-_EPB_FTR_FORMAT = '<I'
-
-# Science header is Little-Endian per QUABO wire format specification.
-_SCIENCE_HDR_FORMAT = '<BBHHIIH'
+# Payload size constants for science packet extraction from raw QUABO response
+_PKT_HEADER_OFFSET = 4
+_PKT_PAYLOAD_LEN    = 512
+_PKT_PAYLOAD_END   = _PKT_HEADER_OFFSET + _PKT_PAYLOAD_LEN # 516
 
 # Pre-built trigger command — 64 bytes, first byte 0x0c, rest zero.
 # Built once at import time so struct.pack() is never called in the hot path.
 _TRIGGER_CMD = struct.pack('B', 0x0c) + b'\x00' * 63
-
-# Payload size constants for science packet extraction from raw QUABO response
-_PKT_HEADER_OFFSET = 4
-_PKT_PAYLOAD_END   = _PKT_HEADER_OFFSET + _PIXEL_DATA_LEN # 516
-
-def calculate_checksum(data_list):
-    """Calculates the 16-bit one's complement sum over a list of buffers."""
-    s = 0
-    for data in data_list:
-        if len(data) % 2 == 1:
-            data = bytes(data) + b'\x00'
-        # Fast C-level struct unpacking; note: 'H' is endian-dependent but 
-        # compensated for by htons() for standard network-order (big-endian) checksums.
-        words = array.array('H')
-        words.frombytes(data)
-        s += sum(words)
-    
-    while (s >> 16):
-        s = (s & 0xFFFF) + (s >> 16)
-        
-    cksum = ~s & 0xffff
-    return socket.htons(cksum)
-
-def calculate_udp_checksum(src_ip, dst_ip, udp_hdr_no_cksum, payload):
-    """Calculates the UDP checksum including the pseudo-header."""
-    pseudo_hdr = struct.pack('!4s4sBBH',
-                             socket.inet_aton(src_ip),
-                             socket.inet_aton(dst_ip),
-                             0, 17, len(udp_hdr_no_cksum) + len(payload))
-    cksum = calculate_checksum([pseudo_hdr, udp_hdr_no_cksum, payload])
-    # RFC 768: If computed checksum is 0, transmit as 0xffff (all ones)
-    return cksum if cksum != 0 else 0xffff
 
 # Site configuration
 SITES = {
@@ -143,20 +96,194 @@ SITES = {
     },
 }
 
-class PcapngWriter:
+class PcapngWriter(DataWriter):
     """
-    Minimal Pcapng writer with support for SHB, IDB, and EPB with nanosecond precision.
-    
-    NOTE: Construction and close() involve synchronous file I/O and should be 
-    performed inside a ThreadPoolExecutor to avoid blocking the event loop.
+    Self-contained Pcapng writer with background I/O, buffering, and rollover.
     """
-    def __init__(self, filename):
-        self.filename = filename
-        self.file = open(filename, 'wb')
-        self.packets_written = 0
+    # PCAP constants
+    _ETH_HDR_LEN    = 14
+    _IP_HDR_LEN     = 20
+    _UDP_HDR_LEN    = 8
+    _SCI_HDR_LEN    = 16
+    _PIXEL_DATA_LEN = 512
+
+    # Pcapng structural constants
+    _EPB_HDR_LEN    = 28
+    _EPB_FTR_LEN    = 4
+
+    # Derived lengths
+    _ETH_IP_LEN     = _ETH_HDR_LEN + _IP_HDR_LEN # 34
+    _NET_HDR_LEN    = _ETH_IP_LEN + _UDP_HDR_LEN  # 42
+    _SCIENCE_LEN    = _SCI_HDR_LEN + _PIXEL_DATA_LEN # 528
+    _CAPTURE_LEN    = _NET_HDR_LEN + _SCIENCE_LEN    # 570
+
+    # EPB alignment
+    _PAD_LEN        = (4 - (_CAPTURE_LEN % 4)) % 4
+    _EPB_PAD        = b'\x00' * _PAD_LEN
+    _EPB_TOTAL_LEN  = _EPB_HDR_LEN + _CAPTURE_LEN + _PAD_LEN + _EPB_FTR_LEN
+
+    _EPB_HDR_FORMAT = '<IIIIIII'
+    _EPB_FTR_FORMAT = '<I'
+
+    # Science header
+    _SCIENCE_HDR_FORMAT = '<BBHHIIH'
+
+    @staticmethod
+    def calculate_checksum(data_list):
+        """Calculates the 16-bit one's complement sum over a list of buffers."""
+        s = 0
+        for data in data_list:
+            if len(data) % 2 == 1:
+                data = bytes(data) + b'\x00'
+            # Fast C-level struct unpacking; note: 'H' is endian-dependent but 
+            # compensated for by htons() for standard network-order (big-endian) checksums.
+            words = array.array('H')
+            words.frombytes(data)
+            s += sum(words)
+        
+        while (s >> 16):
+            s = (s & 0xFFFF) + (s >> 16)
+            
+        cksum = ~s & 0xffff
+        return socket.htons(cksum)
+
+    @staticmethod
+    def calculate_udp_checksum(src_ip, dst_ip, udp_hdr_no_cksum, payload):
+        """Calculates the UDP checksum including the pseudo-header."""
+        pseudo_hdr = struct.pack('!4s4sBBH',
+                                 socket.inet_aton(src_ip),
+                                 socket.inet_aton(dst_ip),
+                                 0, 17, len(udp_hdr_no_cksum) + len(payload))
+        cksum = PcapngWriter.calculate_checksum([pseudo_hdr, udp_hdr_no_cksum, payload])
+        # RFC 768: If computed checksum is 0, transmit as 0xffff (all ones)
+        return cksum if cksum != 0 else 0xffff
+
+    def __init__(self, template: str, scope: str, site_info: dict,
+                 quabos: list, rollover: int, buffer: int,
+                 compute_checksums: bool, logger) -> None:
+        self.template = template
+        self.scope = scope
+        self.site_info = site_info
+        self.quabos = quabos
+        self.rollover = rollover
+        self.buffer_max = buffer
+        self.compute_checksums = compute_checksums
+        self.logger = logger
+
+        # Internal state
+        self.last_rollover_sec = 0
+        self.packets_written_total = 0
+        self.current_filename = None
+        self.file_handle = None
+        self.packets_in_current_file = 0
+
+        # Buffering
+        self.buffer = bytearray(self._EPB_TOTAL_LEN * self.buffer_max)
+        self.buffer_ptr = 0
+        self.buffer_count = 0
+
+        # Background I/O
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.write_queue = asyncio.Queue()
+        self.pending_data_count = 0
+        self.disk_misses_since_last_report = 0
+        self.writer_task = None
+        self.writer_failed = False
+
+        self._precalculate_headers()
+
+    def _precalculate_headers(self):
+        """Pre-calculates static Ethernet/IP/UDP headers for each quabo."""
+        self.quabo_headers = {}
+        for idx, q in enumerate(self.quabos):
+            # Ethernet (14B)
+            eth = struct.pack('!6s6sH', b'\x00'*6, b'\x00'*6, 0x0800)
+            
+            # IP (20B)
+            total_len = self._IP_HDR_LEN + self._UDP_HDR_LEN + self._SCIENCE_LEN
+            ip_no_cksum = struct.pack('!BBHHHBBH4s4s', 
+                                      0x45, 0, total_len, 0, 0x4000, 64, 17, 0, 
+                                      socket.inet_aton(q.ip), socket.inet_aton(self.site_info['daq_ip']))
+            
+            ip_cksum = 0
+            if self.compute_checksums:
+                ip_cksum = self.calculate_checksum([ip_no_cksum])
+                
+            ip_hdr = struct.pack('!BBHHHBBH4s4s', 
+                                 0x45, 0, total_len, 0, 0x4000, 64, 17, ip_cksum, 
+                                 socket.inet_aton(q.ip), socket.inet_aton(self.site_info['daq_ip']))
+            
+            # UDP (8B)
+            udp_hdr_base = struct.pack('!HHH', 60001, 60001, self._UDP_HDR_LEN + self._SCIENCE_LEN)
+            
+            boardloc = (self.site_info['module_id'] << 2) | idx
+
+            if not self.compute_checksums:
+                # Full static header possible if no checksums
+                udp_hdr = udp_hdr_base + b'\x00\x00'
+                precalculated_net_hdr = eth + ip_hdr + udp_hdr
+            else:
+                # Only Eth + IP is static
+                precalculated_net_hdr = eth + ip_hdr
+            
+            self.quabo_headers[q] = {
+                'net_hdr': precalculated_net_hdr,
+                'udp_hdr_base': udp_hdr_base,
+                'boardloc': boardloc
+            }
+
+    def start(self, loop):
+        """Starts the background writer task."""
+        self.writer_task = loop.create_task(self._disk_writer())
+
+    async def _disk_writer(self):
+        """Dedicated coroutine handling ALL disk I/O."""
+        loop = asyncio.get_event_loop()
+        
+        while True:
+            item = await self.write_queue.get()
+            if item is None: # Shutdown sentinel
+                self._close_current_file()
+                self.write_queue.task_done()
+                self.executor.shutdown(wait=True)
+                break
+                
+            cmd, payload = item
+            if cmd == "DATA":
+                self.pending_data_count -= 1
+            try:
+                if cmd == "DATA" and self.file_handle:
+                    data, count = payload
+                    await loop.run_in_executor(self.executor, self._write_raw, data, count)
+                elif cmd == "ROLLOVER":
+                    self._close_current_file()
+                    # Open the new file safely in the background thread
+                    try:
+                        await loop.run_in_executor(self.executor, self._open_file, payload)
+                    except Exception as e:
+                        self.logger.critical(f"Failed to open output file {payload}: {e}. Stopping PCAP writing.")
+                        self.writer_failed = True
+                        break
+            except Exception as e:
+                self.logger.error(f"PCAP disk writer error: {e}")
+            finally:
+                self.write_queue.task_done()
+
+    def _open_file(self, filename):
+        self.current_filename = filename
+        self.file_handle = open(filename, 'wb')
+        self.packets_in_current_file = 0
         self._write_shb()
         self._write_idb()
-        self.file.flush()
+        self.file_handle.flush()
+        self.logger.info(f"Opened {filename}")
+
+    def _close_current_file(self):
+        if self.file_handle:
+            self.logger.info(f"Closing {self.current_filename}, {self.packets_in_current_file} packets written.")
+            self.file_handle.close()
+            self.file_handle = None
+            self.current_filename = None
 
     def _write_shb(self):
         # Section Header Block (SHB)
@@ -175,7 +302,7 @@ class PcapngWriter:
         shb_body = struct.pack('<IHHq', 0x1A2B3C4D, 1, 0, -1)
         shb_len = 28 + len(options)
         shb_block = struct.pack('<II', 0x0A0D0D0A, shb_len) + shb_body + options + struct.pack('<I', shb_len)
-        self.file.write(shb_block)
+        self.file_handle.write(shb_block)
 
     def _write_idb(self):
         # Interface Description Block (IDB)
@@ -187,19 +314,151 @@ class PcapngWriter:
         )
         idb_len = 20 + len(options)
         idb_block = struct.pack('<II', 0x00000001, idb_len) + idb_body + options + struct.pack('<I', idb_len)
-        self.file.write(idb_block)
+        self.file_handle.write(idb_block)
 
-    def write_raw(self, data, count):
-        """Writes a pre-assembled block of EPB packets directly to disk."""
-        if self.file:
-            self.file.write(data)
-            self.file.flush()
-            self.packets_written += count
+    def _write_raw(self, data, count):
+        if self.file_handle:
+            self.file_handle.write(data)
+            self.file_handle.flush()
+            self.packets_in_current_file += count
+            self.packets_written_total += count
 
-    def close(self):
-        if self.file:
-            self.file.close()
-            self.file = None
+    def write_packet(self, q, pixel_data, ts_tai, nanosec, ts_utc, cycle_count) -> None:
+        if self.writer_failed:
+            return
+
+        # Check for rollover
+        self._manage_rollover(int(ts_utc))
+
+        # Assemble EPB
+        ptr = self.buffer_ptr
+        hdr = self.quabo_headers[q]
+        
+        # 1. Pcapng EPB Header (32B)
+        ts_total_ns = int(ts_utc) * 1_000_000_000 + int(nanosec)
+        ts_high = ts_total_ns >> 32
+        ts_low = ts_total_ns & 0xFFFFFFFF
+        struct.pack_into(self._EPB_HDR_FORMAT, self.buffer, ptr,
+                         0x00000006, self._EPB_TOTAL_LEN, 0, ts_high, ts_low, self._CAPTURE_LEN, self._CAPTURE_LEN)
+        
+        # 2. Network Header (Eth + IP + UDP)
+        if not self.compute_checksums:
+            # Full static header (42B)
+            self.buffer[ptr+self._EPB_HDR_LEN:ptr+self._EPB_HDR_LEN+self._NET_HDR_LEN] = hdr['net_hdr']
+            sci_ptr = ptr + self._EPB_HDR_LEN + self._NET_HDR_LEN
+        else:
+            # Static Eth + IP (34B)
+            self.buffer[ptr+self._EPB_HDR_LEN:ptr+self._EPB_HDR_LEN+self._ETH_IP_LEN] = hdr['net_hdr']
+            
+            # 3. Science Header (16B) - written early for checksumming
+            sci_ptr = ptr + self._EPB_HDR_LEN + self._NET_HDR_LEN
+            struct.pack_into(self._SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
+                             0x01, 1, cycle_count % 65536, hdr['boardloc'], ts_tai, nanosec, 1)
+            
+            # 4. Pixel Data (512B) - written early for checksumming
+            self.buffer[sci_ptr+self._SCI_HDR_LEN:sci_ptr+self._SCI_HDR_LEN+self._PIXEL_DATA_LEN] = pixel_data
+            
+            # Calculate UDP checksum using a memoryview of the assembled payload
+            payload_view = memoryview(self.buffer)[sci_ptr:sci_ptr+self._SCIENCE_LEN]
+            udp_cksum = self.calculate_udp_checksum(q.ip, self.site_info['daq_ip'], hdr['udp_hdr_base'] + b'\x00\x00', payload_view)
+            
+            # UDP Header (8B)
+            self.buffer[ptr+self._EPB_HDR_LEN+self._ETH_IP_LEN:ptr+self._EPB_HDR_LEN+self._ETH_IP_LEN+6] = hdr['udp_hdr_base']
+            struct.pack_into('!H', self.buffer, ptr+self._EPB_HDR_LEN+self._ETH_IP_LEN+6, udp_cksum)
+
+        if not self.compute_checksums:
+            # 3. Science Header (16B)
+            struct.pack_into(self._SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
+                             0x01, 1, cycle_count % 65536, hdr['boardloc'], ts_tai, nanosec, 1)
+            
+            # 4. Pixel Data (512B)
+            self.buffer[sci_ptr+self._SCI_HDR_LEN:sci_ptr+self._SCI_HDR_LEN+self._PIXEL_DATA_LEN] = pixel_data
+        
+        # 5. EPB Padding and Footer
+        self.buffer[ptr+self._EPB_HDR_LEN+self._CAPTURE_LEN:ptr+self._EPB_HDR_LEN+self._CAPTURE_LEN+self._PAD_LEN] = self._EPB_PAD
+        struct.pack_into(self._EPB_FTR_FORMAT, self.buffer, ptr+self._EPB_TOTAL_LEN-4, self._EPB_TOTAL_LEN)
+        
+        self.buffer_ptr += self._EPB_TOTAL_LEN
+        self.buffer_count += 1
+        
+        if self.buffer_count >= self.buffer_max:
+            self._flush_buffer_to_queue()
+
+    def _flush_buffer_to_queue(self):
+        if self.buffer_count == 0:
+            return
+            
+        data = bytes(self.buffer[:self.buffer_ptr])
+        self._enqueue_item(("DATA", (data, self.buffer_count)))
+        
+        self.buffer_ptr = 0
+        self.buffer_count = 0
+
+    def _manage_rollover(self, ts_utc):
+        is_due = (self.last_rollover_sec == 0 or 
+                  (self.rollover > 0 and ts_utc - self.last_rollover_sec >= self.rollover))
+
+        if is_due:
+            self._flush_buffer_to_queue()
+
+            dt = datetime.datetime.fromtimestamp(ts_utc)
+            filename = self.template.format(
+                scope=self.scope, date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
+            )
+            self._enqueue_item(("ROLLOVER", filename))
+            self.last_rollover_sec = ts_utc
+
+    def _enqueue_item(self, item):
+        cmd, payload = item
+        if cmd == "DATA":
+            if self.pending_data_count >= 100:
+                _, count = payload
+                if self.disk_misses_since_last_report == 0:
+                    self.logger.warning(f"PCAP write queue full — dropping {count} packets (further warnings suppressed)")
+                self.disk_misses_since_last_report += count
+                return
+            self.pending_data_count += 1            
+        self.write_queue.put_nowait(item)
+
+    def drain_miss_count(self) -> int:
+        count = self.disk_misses_since_last_report
+        self.disk_misses_since_last_report = 0
+        return count
+
+    def close(self) -> None:
+        try:
+            loop = asyncio.get_event_loop()
+            loop_is_running = loop.is_running()
+        except (RuntimeError, AttributeError):
+            loop_is_running = False
+        
+        if loop_is_running:
+            try:
+                self._flush_buffer_to_queue()
+                self.write_queue.put_nowait(None)
+            except (RuntimeError, asyncio.QueueFull):
+                pass
+        else:
+            if self.buffer_count > 0:
+                data = bytes(self.buffer[:self.buffer_ptr])
+                self.write_queue.put_nowait(("DATA", (data, self.buffer_count)))
+            self.write_queue.put_nowait(None)
+            # If the loop is already dead, the _disk_writer task won't run.
+            # We must shutdown the executor here to at least try to flush.
+            self.executor.shutdown(wait=True)
+
+class PffWriter(DataWriter):
+    def __init__(self, template: str, scope: str, max_size_mb: int, logger) -> None:
+        self.template = template
+        self.scope = scope
+        self.max_size_mb = max_size_mb
+        self.logger = logger
+
+    def write_packet(self, q, pixel_data, ts_tai, nanosec, ts_utc, cycle_count) -> None:
+        self.logger.debug("PffWriter: write_packet (stub)")
+
+    def close(self) -> None:
+        pass
 
 class QuaboManager(asyncio.DatagramProtocol):
     """Manages a single persistent UDP socket for all quabos."""
@@ -224,7 +483,7 @@ class QuaboManager(asyncio.DatagramProtocol):
 
         Must be called from the event loop thread (i.e. not from an executor).
         """
-        loop    = asyncio.get_running_loop()
+        loop    = asyncio.get_event_loop()
         futures = []
         for q in quabos:
             addr = (q.ip, q.port)
@@ -260,7 +519,7 @@ class QuaboManager(asyncio.DatagramProtocol):
         """
         # Create a single list of tasks. None values from send_all are 
         # converted to pre-completed futures that return None.
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         tasks = []
         for fut in futures:
             if fut is None:
@@ -305,35 +564,40 @@ class PedestalGenerator:
         
         self.quabos = self._init_quabos()
         self._validate_quabos()
-        self._precalculate_headers()
         
         self.total_generated = 0
         self.generated_since_last_report = 0
         self.dropped_cycles = 0
         
         self.cycle_count = 0
-        self.last_rollover_sec = 0
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.manager = None
         self.transport = None
 
-        # Pre-allocated zero-join buffer
-        self.buffer_ptr = 0
-        self.buffer_count = 0
-        self.buffer_max = args.buffer
-        self.buffer = bytearray(_EPB_TOTAL_LEN * self.buffer_max)
-
-        # Producer-consumer write queue.
-        # We use an unbounded queue but manually cap pending data items to 100 to avoid runaway memory,
-        # which guarantees critical commands (ROLLOVER, SHUTDOWN) are never dropped.
-        self._write_queue = asyncio.Queue()
-        self._pending_data_count = 0
-        self._writer_task = None
-        self._watchdog_task = None
-        self._writer_failed = False
+        self.writers = []
+        if args.pcap:
+            self.writers.append(PcapngWriter(
+                template=args.pcap_output,
+                scope=self.scope,
+                site_info=self.site_info,
+                quabos=self.quabos,
+                rollover=args.pcap_rollover,
+                buffer=args.pcap_buffer,
+                compute_checksums=args.compute_checksums,
+                logger=self.logger
+            ))
+        if args.pff:
+            self.writers.append(PffWriter(
+                template=args.pff_output,
+                scope=self.scope,
+                max_size_mb=args.pff_max_size,
+                logger=self.logger
+            ))
         
-        # Track packets dropped due to queue overflow
-        self.disk_misses_since_last_report = 0
+        if not self.writers:
+            # This should be caught by argparse validation, but just in case
+            raise ValueError("At least one output format must be selected (--pcap and/or --pff)")
+
+        self._watchdog_task = None
 
         # Calculate effective polling period and trigger offset (phase)
         if self.args.frequency > 0:
@@ -346,42 +610,6 @@ class PedestalGenerator:
         # Per user request: align phase to middle of 1st second (0.5s offset)
         # for low frequencies, or middle of period for high frequencies.
         self.trigger_offset = 0.5 * min(self.period, 1.0)
-
-    def _precalculate_headers(self):
-        """Pre-calculates static Ethernet/IP/UDP headers for each quabo."""
-        for idx, q in enumerate(self.quabos):
-            # Ethernet (14B)
-            eth = struct.pack('!6s6sH', b'\x00'*6, b'\x00'*6, 0x0800)
-            
-            # IP (20B)
-            total_len = _IP_HDR_LEN + _UDP_HDR_LEN + _SCIENCE_LEN
-            ip_no_cksum = struct.pack('!BBHHHBBH4s4s', 
-                                      0x45, 0, total_len, 0, 0x4000, 64, 17, 0, 
-                                      socket.inet_aton(q.ip), socket.inet_aton(self.site_info['daq_ip']))
-            
-            ip_cksum = 0
-            if self.args.compute_checksums:
-                ip_cksum = calculate_checksum([ip_no_cksum])
-                
-            ip_hdr = struct.pack('!BBHHHBBH4s4s', 
-                                 0x45, 0, total_len, 0, 0x4000, 64, 17, ip_cksum, 
-                                 socket.inet_aton(q.ip), socket.inet_aton(self.site_info['daq_ip']))
-            
-            # UDP (8B)
-            # If checksums are enabled, we can't pre-calculate the full UDP header because 
-            # the checksum depends on the payload (which contains variable timestamps).
-            # We'll pre-pack the first 6 bytes and handle the checksum in the hot path.
-            q.udp_hdr_base = struct.pack('!HHH', 60001, 60001, _UDP_HDR_LEN + _SCIENCE_LEN)
-            
-            if not self.args.compute_checksums:
-                # Full static header possible if no checksums
-                udp_hdr = q.udp_hdr_base + b'\x00\x00'
-                q.precalculated_net_hdr = eth + ip_hdr + udp_hdr
-            else:
-                # Only Eth + IP is static
-                q.precalculated_net_hdr = eth + ip_hdr
-            
-            q.boardloc = (self.site_info['module_id'] << 2) | idx
 
     def _init_quabos(self):
         """
@@ -430,154 +658,15 @@ class PedestalGenerator:
                 raise ValueError(f"Duplicate quabo address identified: {addr}")
             addrs.add(addr)
 
-    async def _disk_writer(self):
-        """Dedicated coroutine handling ALL disk I/O."""
-        loop = asyncio.get_running_loop()
-        current_writer = None
-        
-        while True:
-            item = await self._write_queue.get()
-            if item is None: # Shutdown sentinel
-                if current_writer:
-                    self.logger.info(f"Closing {current_writer.filename}, {current_writer.packets_written} packets written.")
-                    await loop.run_in_executor(self.executor, current_writer.close)
-                self._write_queue.task_done()
-                break
-                
-            cmd, payload = item
-            if cmd == "DATA":
-                self._pending_data_count -= 1
-            try:
-                if cmd == "DATA" and current_writer:
-                    data, count = payload
-                    await loop.run_in_executor(self.executor, current_writer.write_raw, data, count)
-                elif cmd == "ROLLOVER":
-                    if current_writer:
-                        self.logger.info(f"Closing {current_writer.filename}, {current_writer.packets_written} packets written.")
-                        await loop.run_in_executor(self.executor, current_writer.close)
-                        current_writer = None
-                    # Open the new file safely in the background thread
-                    try:
-                        current_writer = await loop.run_in_executor(self.executor, PcapngWriter, payload)
-                        self.logger.info(f"Opened {current_writer.filename}")
-                    except Exception as e:
-                        self.logger.critical(f"Failed to open output file {payload}: {e}. Stopping data capture.")
-                        self._writer_failed = True
-                        break
-            except Exception as e:
-                self.logger.error(f"Disk writer error: {e}")
-            finally:
-                self._write_queue.task_done()
-
-    def _enqueue_item(self, item):
-        """
-        Non-blocking enqueue for commands and data.
-        Only "DATA" items are eligible for dropping during queue overflows.
-        """
-        cmd, payload = item
-        if cmd == "DATA":
-            if self._pending_data_count >= 100:
-                _, count = payload
-                if self.disk_misses_since_last_report == 0:
-                    self.logger.warning(f"Write queue full — dropping {count} packets (further warnings suppressed)")
-                self.disk_misses_since_last_report += count
-                return
-            self._pending_data_count += 1            
-        self._write_queue.put_nowait(item)
-
-    def _write_pcap(self, q_idx, pixel_data, ts_tai, nanosec, ts_utc):
-        """
-        Assembles a full Pcapng EPB (including Network and Science headers)
-        directly into the pre-allocated bytearray using struct.pack_into.
-        """
-        q = self.quabos[q_idx]
-        ptr = self.buffer_ptr
-        
-        # 1. Pcapng EPB Header (32B)
-        ts_total_ns = int(ts_utc) * 1_000_000_000 + int(nanosec)
-        ts_high = ts_total_ns >> 32
-        ts_low = ts_total_ns & 0xFFFFFFFF
-        struct.pack_into(_EPB_HDR_FORMAT, self.buffer, ptr,
-                         0x00000006, _EPB_TOTAL_LEN, 0, ts_high, ts_low, _CAPTURE_LEN, _CAPTURE_LEN)
-        
-        # 2. Network Header (Eth + IP + UDP)
-        if not self.args.compute_checksums:
-            # Full static header (42B)
-            self.buffer[ptr+_EPB_HDR_LEN:ptr+_EPB_HDR_LEN+_NET_HDR_LEN] = q.precalculated_net_hdr
-            sci_ptr = ptr + _EPB_HDR_LEN + _NET_HDR_LEN
-        else:
-            # Static Eth + IP (34B)
-            self.buffer[ptr+_EPB_HDR_LEN:ptr+_EPB_HDR_LEN+_ETH_IP_LEN] = q.precalculated_net_hdr
-            
-            # 3. Science Header (16B) - written early for checksumming
-            sci_ptr = ptr + _EPB_HDR_LEN + _NET_HDR_LEN
-            struct.pack_into(_SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
-                             0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
-            
-            # 4. Pixel Data (512B) - written early for checksumming
-            self.buffer[sci_ptr+_SCI_HDR_LEN:sci_ptr+_SCI_HDR_LEN+_PIXEL_DATA_LEN] = pixel_data
-            
-            # Calculate UDP checksum using a memoryview of the assembled payload
-            payload_view = memoryview(self.buffer)[sci_ptr:sci_ptr+_SCIENCE_LEN]
-            udp_cksum = calculate_udp_checksum(q.ip, self.site_info['daq_ip'], q.udp_hdr_base + b'\x00\x00', payload_view)
-            
-            # UDP Header (8B)
-            self.buffer[ptr+_EPB_HDR_LEN+_ETH_IP_LEN:ptr+_EPB_HDR_LEN+_ETH_IP_LEN+6] = q.udp_hdr_base
-            struct.pack_into('!H', self.buffer, ptr+_EPB_HDR_LEN+_ETH_IP_LEN+6, udp_cksum)
-
-        if not self.args.compute_checksums:
-            # 3. Science Header (16B)
-            struct.pack_into(_SCIENCE_HDR_FORMAT, self.buffer, sci_ptr,
-                             0x01, 1, self.cycle_count % 65536, q.boardloc, ts_tai, nanosec, 1)
-            
-            # 4. Pixel Data (512B)
-            self.buffer[sci_ptr+_SCI_HDR_LEN:sci_ptr+_SCI_HDR_LEN+_PIXEL_DATA_LEN] = pixel_data
-        
-        # 5. EPB Padding and Footer
-        self.buffer[ptr+_EPB_HDR_LEN+_CAPTURE_LEN:ptr+_EPB_HDR_LEN+_CAPTURE_LEN+_PAD_LEN] = _EPB_PAD
-        struct.pack_into(_EPB_FTR_FORMAT, self.buffer, ptr+_EPB_TOTAL_LEN-4, _EPB_TOTAL_LEN)
-        
-        self.buffer_ptr += _EPB_TOTAL_LEN
-        self.buffer_count += 1
-        
-        if self.buffer_count >= self.buffer_max:
-            self._flush_buffer_to_queue()
-
-    def _flush_buffer_to_queue(self):
-        """Send the current buffer slice to the write queue and reset pointers."""
-        if self.buffer_count == 0:
-            return
-            
-        # Create a single copy of the active buffer slice.
-        # This is one allocation per 'buffer_max' packets.
-        data = bytes(self.buffer[:self.buffer_ptr])
-        self._enqueue_item(("DATA", (data, self.buffer_count)))
-        
-        self.buffer_ptr = 0
-        self.buffer_count = 0
-
-    async def _manage_rollover(self, ts_utc):
-        """Signals the background thread to roll over the file."""
-        # Check if a rollover is due. If args.rollover is 0, we never roll over.
-        is_due = (self.last_rollover_sec == 0 or 
-                  (self.args.rollover > 0 and ts_utc - self.last_rollover_sec >= self.args.rollover))
-
-        if is_due:
-            self._flush_buffer_to_queue()
-
-            dt = datetime.datetime.fromtimestamp(ts_utc)
-            filename = self.args.output.format(
-                scope=self.scope, date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
-            )
-            self.logger.debug(f"Requesting file rollover to {filename}")
-
-            # Send a "ROLLOVER" command
-            self._enqueue_item(("ROLLOVER", filename))
-            self.last_rollover_sec = ts_utc
-
     def _print_watchdog_report(self, is_final=False):
+        # Gather disk misses from all writers
+        disk_misses = 0
+        for writer in self.writers:
+            if isinstance(writer, PcapngWriter):
+                disk_misses += writer.drain_miss_count()
+
         if is_final:
-            total_activity = self.generated_since_last_report + self.dropped_cycles + sum(q.misses_since_last_report for q in self.quabos) + self.disk_misses_since_last_report
+            total_activity = self.generated_since_last_report + self.dropped_cycles + sum(q.misses_since_last_report for q in self.quabos) + disk_misses
             if total_activity == 0:
                 return
             
@@ -587,8 +676,8 @@ class PedestalGenerator:
                 miss_reports.append(f"Q{i}: {q.misses_since_last_report}")
         
         # Add disk drops to miss reports
-        if self.disk_misses_since_last_report > 0:
-            miss_reports.append(f"Disk: {self.disk_misses_since_last_report}")
+        if disk_misses > 0:
+            miss_reports.append(f"Disk: {disk_misses}")
         
         if not miss_reports:
             miss_str = "no missed packets"
@@ -603,7 +692,6 @@ class PedestalGenerator:
         # Reset delta stats
         self.generated_since_last_report = 0
         self.dropped_cycles = 0
-        self.disk_misses_since_last_report = 0
         for q in self.quabos:
             q.misses_since_last_report = 0
 
@@ -613,7 +701,7 @@ class PedestalGenerator:
             self._print_watchdog_report(is_final=False)
 
     async def run(self):
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         # Initialize the single shared socket
         self.transport, self.manager = await loop.create_datagram_endpoint(
             lambda: QuaboManager(),
@@ -634,11 +722,14 @@ class PedestalGenerator:
         local_addr = self.transport.get_extra_info('sockname')
         frequecy_string = f'1/{-self.args.frequency}' if self.args.frequency < -1 else f'{max(1,self.args.frequency)}'
         self.logger.info(f"Starting pedestal capture at {frequecy_string} Hz")
-        self.logger.info(f"Bound to local UDP port {local_addr[1]} (buffer={self.args.buffer})")
+        self.logger.info(f"Bound to local UDP port {local_addr[1]}")
         
         # Start background tasks with proper handles for clean shutdown
-        self._writer_task   = asyncio.create_task(self._disk_writer())
-        self._watchdog_task = asyncio.create_task(self._watchdog())
+        for writer in self.writers:
+            if hasattr(writer, 'start'):
+                writer.start(loop)
+        
+        self._watchdog_task = loop.create_task(self._watchdog())
 
         # ----------------------------------------------------------------
         # Schedule anchor: record wall time and monotonic time together so
@@ -664,14 +755,16 @@ class PedestalGenerator:
         else:
             timeout = max(MIN_TIMEOUT, 0.5 * min(self.period, 1.0))
 
-        # Create the initial pcap file immediately
-        await self._manage_rollover(wall_epoch)
-        
         try:
             while True:
-                # Check if the writer task has encountered a critical failure
-                if self._writer_failed:
-                    self.logger.info("Writer task failed — stopping capture.")
+                # Check if any writer task has encountered a critical failure
+                writer_failed = False
+                for writer in self.writers:
+                    if getattr(writer, 'writer_failed', False):
+                        self.logger.info(f"A writer failed — stopping capture.")
+                        writer_failed = True
+                        break
+                if writer_failed:
                     break
                 
                 trigger_wall = wall_epoch + slot * self.period + self.trigger_offset
@@ -708,7 +801,6 @@ class PedestalGenerator:
 
                 # Post-receive housekeeping (rollover, stats, buffering) — all
                 # of this happens after packets are already on the wire.
-                await self._manage_rollover(int(ts_utc))
                 self.total_generated += 1
                 self.generated_since_last_report += 1
 
@@ -730,7 +822,8 @@ class PedestalGenerator:
 
                         # Optimized in-place buffer assembly using memoryview to avoid copies
                         view = memoryview(data)[_PKT_HEADER_OFFSET:_PKT_PAYLOAD_END]
-                        self._write_pcap(idx, view, ts_tai, nanosec, ts_utc)
+                        for writer in self.writers:
+                            writer.write_packet(q, view, ts_tai, nanosec, ts_utc, self.cycle_count)
                     else:
                         if self.logger.isEnabledFor(logging.DEBUG):
                             self.logger.debug(f"Quabo {idx} timeout waiting for response")
@@ -753,65 +846,63 @@ class PedestalGenerator:
             
             try:
                 try:
-                    loop = asyncio.get_running_loop()
-                    loop_is_running = True
-                except RuntimeError:
+                    loop = asyncio.get_event_loop()
+                    loop_is_running = loop.is_running()
+                except (RuntimeError, AttributeError):
                     # Loop is not running (or we're not in an async context)
                     loop_is_running = False
                 
+                # Close all writers (synchronous cleanup/drain)
+                for writer in self.writers:
+                    writer.close()
+                
                 if loop_is_running:
-                    # Normal Case: flush remaining buffer data, then push the None 
-                    # sentinel to gracefully stop the disk writer.
-                    self._flush_buffer_to_queue()
-                    await self._write_queue.put(None)
+                    # Wait for writer tasks to finish if possible
+                    tasks = [w.writer_task for w in self.writers if isinstance(w, PcapngWriter) and w.writer_task]
+                    if tasks:
+                        try:
+                            # In this 'finally' block, we are usually still in the coroutine.
+                            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
+                        except (asyncio.TimeoutError, RuntimeError, asyncio.CancelledError):
+                            pass
                     
-                    try:
-                        await asyncio.wait_for(self._writer_task, timeout=10.0)
-                    except asyncio.TimeoutError:
-                        self.logger.error("Writer task did not finish in time — some data may be lost")
-                        self._writer_task.cancel()
-                    
-                    # Clean up the watchdog task (only await if loop is actually running)
-                    self._watchdog_task.cancel()
-                    try:
-                        await self._watchdog_task
-                    except asyncio.CancelledError:
-                        pass
+                    # Clean up the watchdog task
+                    if self._watchdog_task:
+                        self._watchdog_task.cancel()
+                        try:
+                            await self._watchdog_task
+                        except (asyncio.CancelledError, RuntimeError):
+                            pass
                 else:
                     # Emergency Fallback: The loop is already dead/closing.
-                    # Since we're outside the async context, we can't await. Flush any buffered data
-                    # and enqueue a sentinel so the writer can process it (even if dormant) and then
-                    # executor.shutdown(wait=True) below will drain the executor thread pool.
-                    self.logger.warning("Event loop is not running during shutdown. Attempting fallback flush...")
-                    
-                    if self.buffer_count > 0:
-                        data = bytes(self.buffer[:self.buffer_ptr])
-                        self.logger.warning(f"Fallback flushing {self.buffer_count} packets to pending queue before executor shutdown...")
-                        self._write_queue.put_nowait(("DATA", (data, self.buffer_count)))
-                    
-                    # Enqueue sentinel so any queued work can be processed by the executor
-                    self._write_queue.put_nowait(None)
-                    
-                    # Cancel only the watchdog (writer is left to handle queued items)
-                    self._watchdog_task.cancel()
+                    self.logger.warning("Event loop is not running during shutdown.")
+                    if self._watchdog_task:
+                        self._watchdog_task.cancel()
 
                 if self.transport:
                     self.transport.close()
             finally:
-                # Force the thread pool to finish any remaining disk writes before exiting.
-                # This is guaranteed to run even if transport.close() or cleanup code raises.
-                self.executor.shutdown(wait=True)
+                pass
 
 async def main():
     parser = argparse.ArgumentParser(description='PANOSETI Pedestal Capture')
     parser.add_argument('--site', '-s', required=True, choices=SITES.keys(), help='Telescope site')
     parser.add_argument('--frequency', type=int, default=1, help=f'Polling frequency in Hz (1–{MAX_FREQUENCY}, or negative for 1/n Hz)')
-    parser.add_argument('--rollover', type=int, default=600, help='File rollover interval in seconds')
-    parser.add_argument('--output', '-o', default='pedestals_{scope}_{date}_{time}.pcapng', help='Output filename template')
+    
+    # PCAP options
+    parser.add_argument('--pcap', action='store_true', help='Enable PCAP output (pcapng format)')
+    parser.add_argument('--pcap-output', default='pedestals_{scope}_{date}_{time}.pcapng', help='Filename template for PCAP files')
+    parser.add_argument('--pcap-rollover', type=int, default=600, help='PCAP file rollover interval in seconds')
+    parser.add_argument('--pcap-buffer', type=int, default=None, help='Number of packets to buffer before writing to disk. Default: frequency (clamped 60–1000)')
+    parser.add_argument('--compute-checksums', action='store_true', help='Compute IP/UDP checksums in PCAP output (CPU intensive)')
+    
+    # PFF options
+    parser.add_argument('--pff', action='store_true', help='Enable PFF output')
+    parser.add_argument('--pff-output', default='pedestals_{scope}_{date}_{time}.pff', help='Filename template for PFF files')
+    parser.add_argument('--pff-max-size', type=int, default=1024, help='PFF file size rollover threshold in MB')
+
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--bind-port', type=int, default=0, help='Local UDP port to bind to (0 for random)')
-    parser.add_argument('--buffer', type=int, default=None, help='Number of packets to buffer before writing to disk. Default: frequency (clamped 60–1000)')
-    parser.add_argument('--compute-checksums', action='store_true', help='Enable IP and UDP checksum calculation (CPU intensive)')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/min(period, 1.0)))')
     parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
@@ -819,21 +910,29 @@ async def main():
     args = parser.parse_args()
 
     # ---- Argument validation ----
+    if not args.pcap and not args.pff:
+        parser.error('At least one output format must be selected (--pcap and/or --pff)')
+
     if not (-MAX_FREQUENCY <= args.frequency <= MAX_FREQUENCY):
         parser.error(f'--frequency must be between -{MAX_FREQUENCY} and {MAX_FREQUENCY}')
     
-    # Dynamic buffer sizing
-    if args.buffer is None:
-        if args.frequency > 0:
-            args.buffer = max(60, min(1000, args.frequency))
-        else:
-            # For low/fractional frequencies, use a sensible floor
-            args.buffer = 60
+    # Dynamic buffer sizing for PCAP
+    if args.pcap:
+        if args.pcap_buffer is None:
+            if args.frequency > 0:
+                args.pcap_buffer = max(60, min(1000, args.frequency))
+            else:
+                # For low/fractional frequencies, use a sensible floor
+                args.pcap_buffer = 60
+        if args.pcap_buffer < 1:
+            parser.error('--pcap-buffer must be >= 1')
+        if args.pcap_rollover < 0:
+            parser.error('--pcap-rollover must be >= 0')
 
-    if args.buffer < 1:
-        parser.error('--buffer must be >= 1')
-    if args.rollover < 0:
-        parser.error('--rollover must be >= 0')
+    if args.pff:
+        if args.pff_max_size <= 0:
+            parser.error('--pff-max-size must be > 0')
+
     if args.timeout is not None and args.timeout <= 0:
         parser.error('--timeout must be > 0')
     if args.watchdog_period <= 0:
@@ -848,7 +947,16 @@ async def main():
     await generator.run()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Shutting down pedestal capture...")
+    if hasattr(asyncio, 'run'):
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            logger.info("Shutting down pedestal capture...")
+    else:
+        loop = asyncio.get_event_loop()
+        try:
+            loop.run_until_complete(main())
+        except KeyboardInterrupt:
+            logger.info("Shutting down pedestal capture...")
+        finally:
+            loop.close()
