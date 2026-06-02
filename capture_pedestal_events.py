@@ -75,12 +75,15 @@ def calculate_checksum(data_list):
         if len(data) % 2 == 1:
             data = bytes(data) + b'\x00'
         # Highly optimized via C-level struct unpacking
-        words = array.array('H', data)
-        s = sum(words)
+        words = array.array('H')
+        words.frombytes(data)
+        s += sum(words)
     
     while (s >> 16):
         s = (s & 0xFFFF) + (s >> 16)
-    return ~s & 0xffff
+        
+    cksum = ~s & 0xffff
+    return socket.htons(cksum)
 
 def calculate_udp_checksum(src_ip, dst_ip, udp_hdr_no_cksum, payload):
     """Calculates the UDP checksum including the pseudo-header."""
@@ -535,29 +538,37 @@ class PedestalGenerator:
             self._enqueue_item(("ROLLOVER", filename))
             self.last_rollover_sec = ts_utc
 
+    def _print_watchdog_report(self, is_final=False):
+        if is_final:
+            total_activity = self.generated_since_last_report + self.dropped_cycles + sum(q.misses_since_last_report for q in self.quabos)
+            if total_activity == 0:
+                return
+            
+        miss_reports = []
+        for i, q in enumerate(self.quabos):
+            if q.misses_since_last_report > 0:
+                miss_reports.append(f"Q{i}: {q.misses_since_last_report}")
+        
+        if not miss_reports:
+            miss_str = "no missed packets"
+        else:
+            miss_str = f"missing packets - {', '.join(miss_reports)}"
+        
+        dropped_str = f", {self.dropped_cycles} cycles dropped" if self.dropped_cycles > 0 else ""
+        prefix = "Final" if is_final else f"Last {self.args.watchdog_period}s"
+        stats_msg = f"{prefix}: {self.generated_since_last_report} pedestal events generated{dropped_str}, {miss_str}"
+        self.logger.info(stats_msg)
+        
+        # Reset delta stats
+        self.generated_since_last_report = 0
+        self.dropped_cycles = 0
+        for q in self.quabos:
+            q.misses_since_last_report = 0
+
     async def _watchdog(self):
         while True:
-            await asyncio.sleep(60) # 1 minute
-            
-            miss_reports = []
-            for i, q in enumerate(self.quabos):
-                if q.misses_since_last_report > 0:
-                    miss_reports.append(f"Q{i}: {q.misses_since_last_report}")
-            
-            if not miss_reports:
-                miss_str = "no missed packets"
-            else:
-                miss_str = f"missing packets - {', '.join(miss_reports)}"
-            
-            dropped_str = f", {self.dropped_cycles} cycles dropped" if self.dropped_cycles > 0 else ""
-            stats_msg = f"Last 60s: {self.generated_since_last_report} pedestal events generated{dropped_str}, {miss_str}"
-            self.logger.info(stats_msg)
-            
-            # Reset delta stats
-            self.generated_since_last_report = 0
-            self.dropped_cycles = 0
-            for q in self.quabos:
-                q.misses_since_last_report = 0
+            await asyncio.sleep(self.args.watchdog_period)
+            self._print_watchdog_report(is_final=False)
 
     async def run(self):
         loop = asyncio.get_running_loop()
@@ -690,12 +701,19 @@ class PedestalGenerator:
             # ----------------------------------------------------------------
             # Clean shutdown: flush remaining data, drain the queue, then close.
             # ----------------------------------------------------------------
-            loop = asyncio.get_running_loop()
+            self._print_watchdog_report(is_final=True)
             
-            if loop.is_running():
-                # Normal Case: Schedule the flush safely via thread-safe call,
-                # then push the None sentinel to gracefully stop the disk writer.
-                loop.call_soon_threadsafe(self._flush_buffer_to_queue)
+            try:
+                loop = asyncio.get_running_loop()
+                loop_is_running = True
+            except RuntimeError:
+                # Loop is not running (or we're not in an async context)
+                loop_is_running = False
+            
+            if loop_is_running:
+                # Normal Case: flush remaining buffer data, then push the None 
+                # sentinel to gracefully stop the disk writer.
+                self._flush_buffer_to_queue()
                 await self._write_queue.put(None)
                 
                 try:
@@ -705,14 +723,19 @@ class PedestalGenerator:
                     self._writer_task.cancel()
             else:
                 # Emergency Fallback: The loop is already dead/closing.
-                # We bypass the queue entirely and force a raw write.
-                self.logger.warning("Event loop is not running during shutdown. Executing fallback direct flush...")
+                # Since we're outside the async context, we can't await, but we should still
+                # attempt to flush buffered data through the thread pool if we have any.
+                self.logger.warning("Event loop is not running during shutdown. Attempting fallback flush...")
                 
                 if self.buffer_count > 0:
                     data = bytes(self.buffer[:self.buffer_ptr])
-                    # If the loop is dead, we can't rely on the async writer task. 
-                    # We log it and let executor shutdown clean up any pending file threads.
-                    self.logger.warning(f"Bypassed queue: {self.buffer_count} packets remaining in memory buffer.")
+                    self.logger.warning(f"Fallback flushing {self.buffer_count} packets to pending queue before executor shutdown...")
+                    # Enqueue the buffered data one last time. The executor.shutdown(wait=True) 
+                    # below will ensure any in-flight writes complete before we exit.
+                    try:
+                        self._write_queue.put_nowait(("DATA", (data, self.buffer_count)))
+                    except asyncio.QueueFull:
+                        self.logger.error(f"Could not enqueue final {self.buffer_count} packets — data loss imminent")
                 
                 self._writer_task.cancel()
 
@@ -742,6 +765,7 @@ async def main():
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/frequency))')
     parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
+    parser.add_argument('--watchdog-period', type=int, default=60, help='Watchdog summary logging period in seconds')
     args = parser.parse_args()
 
     # ---- Argument validation ----
@@ -758,6 +782,8 @@ async def main():
         parser.error('--rollover must be >= 0')
     if args.timeout is not None and args.timeout <= 0:
         parser.error('--timeout must be > 0')
+    if args.watchdog_period <= 0:
+        parser.error('--watchdog-period must be > 0')
 
     numeric_level = getattr(logging, args.log_level.upper(), None)
     if not isinstance(numeric_level, int):
