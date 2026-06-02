@@ -335,6 +335,18 @@ class PedestalGenerator:
         # Track packets dropped due to queue overflow
         self.disk_misses_since_last_report = 0
 
+        # Calculate effective polling period and trigger offset (phase)
+        if self.args.frequency > 0:
+            self.period = 1.0 / self.args.frequency
+        elif self.args.frequency < 0:
+            self.period = float(abs(self.args.frequency))
+        else: # 0
+            self.period = 1.0
+            
+        # Per user request: align phase to middle of 1st second (0.5s offset)
+        # for low frequencies, or middle of period for high frequencies.
+        self.trigger_offset = 0.5 * min(self.period, 1.0)
+
     def _precalculate_headers(self):
         """Pre-calculates static Ethernet/IP/UDP headers for each quabo."""
         for idx, q in enumerate(self.quabos):
@@ -620,7 +632,8 @@ class PedestalGenerator:
                 self.logger.warning(f"Could not set UDP receive buffer: {e}")
 
         local_addr = self.transport.get_extra_info('sockname')
-        self.logger.info(f"Starting pedestal capture at {self.args.frequency} Hz")
+        frequecy_string = f'1/{-self.args.frequency}' if self.args.frequency < -1 else f'{max(1,self.args.frequency)}'
+        self.logger.info(f"Starting pedestal capture at {frequecy_string} Hz")
         self.logger.info(f"Bound to local UDP port {local_addr[1]} (buffer={self.args.buffer})")
         
         # Start background tasks with proper handles for clean shutdown
@@ -638,7 +651,7 @@ class PedestalGenerator:
         # Skip any slots that have already passed
         now_wall = time.time()
         slot = 0
-        while wall_epoch + (slot + 0.5) / self.args.frequency <= now_wall:
+        while wall_epoch + slot * self.period + self.trigger_offset <= now_wall:
             slot += 1
 
         # Monotonic time corresponding to the start of wall_epoch
@@ -649,12 +662,11 @@ class PedestalGenerator:
         if self.args.timeout is not None:
             timeout = self.args.timeout
         else:
-            timeout = max(MIN_TIMEOUT, 0.5 / self.args.frequency)
+            timeout = max(MIN_TIMEOUT, 0.5 * min(self.period, 1.0))
 
         # Create the initial pcap file immediately
         await self._manage_rollover(wall_epoch)
         
-        period = 1 / self.args.frequency
         try:
             while True:
                 # Check if the writer task has encountered a critical failure
@@ -662,8 +674,8 @@ class PedestalGenerator:
                     self.logger.info("Writer task failed — stopping capture.")
                     break
                 
-                trigger_wall = wall_epoch + (slot + 0.5) / self.args.frequency
-                trigger_mono = mono_epoch + (slot + 0.5) * period
+                trigger_wall = wall_epoch + slot * self.period + self.trigger_offset
+                trigger_mono = mono_epoch + slot * self.period + self.trigger_offset
 
                 sleep_dur = trigger_mono - time.monotonic()
                 while sleep_dur < -0.1:
@@ -672,9 +684,9 @@ class PedestalGenerator:
                     self.dropped_cycles += 1
                     slot += 1
                     self.cycle_count += 1                    
-                    trigger_wall += period
-                    trigger_mono += period
-                    sleep_dur += 1 / self.args.frequency
+                    trigger_wall += self.period
+                    trigger_mono += self.period
+                    sleep_dur += self.period
                 if sleep_dur > 0:
                     await asyncio.sleep(sleep_dur)
 
@@ -688,8 +700,8 @@ class PedestalGenerator:
 
                 ts_utc = trigger_wall
                 ts_tai = int(ts_utc) + self.args.tai_offset
-                slot_within_second = slot % self.args.frequency
-                nanosec = int((slot_within_second + 0.5) * period * 1_000_000_000)
+                # Calculate nanoseconds within the current wall-clock second
+                nanosec = int(round((trigger_wall % 1.0) * 1_000_000_000))
 
                 # Now await responses — timeout is shared across all boards.
                 results = await self.manager.wait_all(futures, timeout)
@@ -793,7 +805,7 @@ class PedestalGenerator:
 async def main():
     parser = argparse.ArgumentParser(description='PANOSETI Pedestal Capture')
     parser.add_argument('--site', '-s', required=True, choices=SITES.keys(), help='Telescope site')
-    parser.add_argument('--frequency', type=int, default=1, help=f'Polling frequency in Hz (1–{MAX_FREQUENCY})')
+    parser.add_argument('--frequency', type=int, default=1, help=f'Polling frequency in Hz (1–{MAX_FREQUENCY}, or negative for 1/n Hz)')
     parser.add_argument('--rollover', type=int, default=600, help='File rollover interval in seconds')
     parser.add_argument('--output', '-o', default='pedestals_{scope}_{date}_{time}.pcapng', help='Output filename template')
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
@@ -801,18 +813,22 @@ async def main():
     parser.add_argument('--buffer', type=int, default=None, help='Number of packets to buffer before writing to disk. Default: frequency (clamped 60–1000)')
     parser.add_argument('--compute-checksums', action='store_true', help='Enable IP and UDP checksum calculation (CPU intensive)')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
-    parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/frequency))')
+    parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/min(period, 1.0)))')
     parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
     parser.add_argument('--watchdog-period', type=int, default=60, help='Watchdog summary logging period in seconds')
     args = parser.parse_args()
 
     # ---- Argument validation ----
-    if not (1 <= args.frequency <= MAX_FREQUENCY):
-        parser.error(f'--frequency must be between 1 and {MAX_FREQUENCY}')
+    if not (-MAX_FREQUENCY <= args.frequency <= MAX_FREQUENCY):
+        parser.error(f'--frequency must be between -{MAX_FREQUENCY} and {MAX_FREQUENCY}')
     
     # Dynamic buffer sizing
     if args.buffer is None:
-        args.buffer = max(60, min(1000, args.frequency))
+        if args.frequency > 0:
+            args.buffer = max(60, min(1000, args.frequency))
+        else:
+            # For low/fractional frequencies, use a sensible floor
+            args.buffer = 60
 
     if args.buffer < 1:
         parser.error('--buffer must be >= 1')
