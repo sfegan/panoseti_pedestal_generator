@@ -318,6 +318,9 @@ class PedestalGenerator:
         self._writer_task = None
         self._watchdog_task = None
         self._writer_failed = False
+        
+        # Track packets dropped due to queue overflow
+        self.disk_misses_since_last_report = 0
 
     def _precalculate_headers(self):
         """Pre-calculates static Ethernet/IP/UDP headers for each quabo."""
@@ -449,7 +452,10 @@ class PedestalGenerator:
         cmd, payload = item
         if cmd == "DATA":
             if self._pending_data_count >= 100:
-                self.logger.warning("Write queue full — dropping incoming DATA item to protect timing")
+                _, count = payload
+                if self.disk_misses_since_last_report == 0:
+                    self.logger.warning(f"Write queue full — dropping {count} packets (further warnings suppressed)")
+                self.disk_misses_since_last_report += count
                 return
             self._pending_data_count += 1            
         self._write_queue.put_nowait(item)
@@ -546,7 +552,7 @@ class PedestalGenerator:
 
     def _print_watchdog_report(self, is_final=False):
         if is_final:
-            total_activity = self.generated_since_last_report + self.dropped_cycles + sum(q.misses_since_last_report for q in self.quabos)
+            total_activity = self.generated_since_last_report + self.dropped_cycles + sum(q.misses_since_last_report for q in self.quabos) + self.disk_misses_since_last_report
             if total_activity == 0:
                 return
             
@@ -554,6 +560,10 @@ class PedestalGenerator:
         for i, q in enumerate(self.quabos):
             if q.misses_since_last_report > 0:
                 miss_reports.append(f"Q{i}: {q.misses_since_last_report}")
+        
+        # Add disk drops to miss reports
+        if self.disk_misses_since_last_report > 0:
+            miss_reports.append(f"Disk: {self.disk_misses_since_last_report}")
         
         if not miss_reports:
             miss_str = "no missed packets"
@@ -568,6 +578,7 @@ class PedestalGenerator:
         # Reset delta stats
         self.generated_since_last_report = 0
         self.dropped_cycles = 0
+        self.disk_misses_since_last_report = 0
         for q in self.quabos:
             q.misses_since_last_report = 0
 
@@ -644,7 +655,7 @@ class PedestalGenerator:
                 sleep_dur = trigger_mono - time.monotonic()
                 while sleep_dur < -0.1:
                     if self.dropped_cycles == 0:
-                        self.logger.warning(f"Cycle {slot} is late by {-sleep_dur:.4f}s .. dropping to catch up (further warnings suppressed until next report)")
+                        self.logger.warning(f"Cycle {slot} is late by {-sleep_dur:.4f}s .. dropping to catch up (further warnings suppressed)")
                     self.dropped_cycles += 1
                     slot += 1
                     self.cycle_count += 1                    
