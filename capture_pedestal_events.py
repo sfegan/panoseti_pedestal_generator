@@ -715,52 +715,68 @@ class PedestalGenerator:
             self._print_watchdog_report(is_final=True)
             
             try:
-                loop = asyncio.get_running_loop()
-                loop_is_running = True
-            except RuntimeError:
-                # Loop is not running (or we're not in an async context)
-                loop_is_running = False
-            
-            if loop_is_running:
-                # Normal Case: flush remaining buffer data, then push the None 
-                # sentinel to gracefully stop the disk writer.
-                self._flush_buffer_to_queue()
-                await self._write_queue.put(None)
-                
                 try:
-                    await asyncio.wait_for(self._writer_task, timeout=10.0)
-                except asyncio.TimeoutError:
-                    self.logger.error("Writer task did not finish in time — some data may be lost")
-                    self._writer_task.cancel()
+                    loop = asyncio.get_running_loop()
+                    loop_is_running = True
+                except RuntimeError:
+                    # Loop is not running (or we're not in an async context)
+                    loop_is_running = False
                 
-                # Clean up the watchdog task (only await if loop is actually running)
-                self._watchdog_task.cancel()
-                try:
-                    await self._watchdog_task
-                except asyncio.CancelledError:
-                    pass
-            else:
-                # Emergency Fallback: The loop is already dead/closing.
-                # Since we're outside the async context, we can't await, but we should still
-                # attempt to flush buffered data through the thread pool if we have any.
-                self.logger.warning("Event loop is not running during shutdown. Attempting fallback flush...")
-                
-                if self.buffer_count > 0:
-                    data = bytes(self.buffer[:self.buffer_ptr])
-                    self.logger.warning(f"Fallback flushing {self.buffer_count} packets to pending queue before executor shutdown...")
-                    # Enqueue the buffered data one last time. The executor.shutdown(wait=True) 
-                    # below will ensure any in-flight writes complete before we exit.
-                    self._write_queue.put_nowait(("DATA", (data, self.buffer_count)))
-                
-                # Cancel tasks (no awaits—loop is dead)
-                self._writer_task.cancel()
-                self._watchdog_task.cancel()
+                if loop_is_running:
+                    # Normal Case: flush remaining buffer data, then push the None 
+                    # sentinel to gracefully stop the disk writer.
+                    self._flush_buffer_to_queue()
+                    await self._write_queue.put(None)
+                    
+                    try:
+                        await asyncio.wait_for(self._writer_task, timeout=10.0)
+                    except asyncio.TimeoutError:
+                        self.logger.error("Writer task did not finish in time — some data may be lost")
+                        self._writer_task.cancel()
+                    
+                    # Clean up the watchdog task (only await if loop is actually running)
+                    self._watchdog_task.cancel()
+                    try:
+                        await self._watchdog_task
+                    except asyncio.CancelledError:
+                        pass
+                else:
+                    # Emergency Fallback: The loop is already dead/closing.
+                    # Since we're outside the async context, we can't await. Flush any buffered data
+                    # and enqueue a sentinel so the writer can process it (even if dormant) and then
+                    # executor.shutdown(wait=True) below will drain the executor thread pool.
+                    self.logger.warning("Event loop is not running during shutdown. Attempting fallback flush...")
+                    
+                    if self.buffer_count > 0:
+                        data = bytes(self.buffer[:self.buffer_ptr])
+                        self.logger.warning(f"Fallback flushing {self.buffer_count} packets to pending queue before executor shutdown...")
+                        self._write_queue.put_nowait(("DATA", (data, self.buffer_count)))
+                    
+                    # Enqueue sentinel so any queued work can be processed by the executor
+                    self._write_queue.put_nowait(None)
+                    
+                    # Cancel only the watchdog (writer is left to handle queued items)
+                    self._watchdog_task.cancel()
 
-            if self.transport:
-                self.transport.close()
+                if self.transport:
+                    self.transport.close()
+            finally:
+                # Force the thread pool to finish any remaining disk writes before exiting.
+                # Use a watchdog thread with timeout to prevent indefinite hangs.
+                import threading
                 
-            # Force the thread pool to finish any remaining disk writes before exiting
-            self.executor.shutdown(wait=True)
+                def shutdown_executor():
+                    self.executor.shutdown(wait=True)
+                
+                shutdown_thread = threading.Thread(target=shutdown_executor, daemon=False)
+                shutdown_thread.start()
+                shutdown_thread.join(timeout=10.0)
+                
+                if shutdown_thread.is_alive():
+                    self.logger.warning("Executor shutdown timeout after 10s — forcing exit")
+                    self.executor.shutdown(wait=False)
+                else:
+                    self.logger.debug("Executor shutdown completed normally")
 
 async def main():
     parser = argparse.ArgumentParser(description='PANOSETI Pedestal Capture')
