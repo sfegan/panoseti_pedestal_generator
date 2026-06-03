@@ -66,7 +66,10 @@ async def run_emulator(quabo_id, bind_ip, port, delay, drop_prob):
     means = [random.uniform(0, 10) for _ in range(256)]
     variances = [random.uniform(10, 20) for _ in range(256)]
     
-    loop = asyncio.get_event_loop()
+    try:
+        loop = asyncio.get_running_loop()
+    except AttributeError:
+        loop = asyncio.get_event_loop()
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: QuaboEmulatorProtocol(quabo_id, means, variances, delay, drop_prob),
         local_addr=(bind_ip, port)
@@ -107,7 +110,10 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\nShutting down emulator...")
     else:
-        loop = asyncio.get_event_loop()
+        try:
+            loop = asyncio.get_running_loop()
+        except AttributeError:
+            loop = asyncio.get_event_loop()
         main_task = asyncio.ensure_future(main(args))
         try:
             loop.run_until_complete(main_task)
