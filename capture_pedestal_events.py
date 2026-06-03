@@ -10,6 +10,7 @@
 # AI usage: Gemini-CLI
 
 import asyncio
+import os
 import struct
 import time
 import datetime
@@ -20,14 +21,6 @@ import logging
 import array
 import abc
 import signal
-
-class DataWriter(abc.ABC):
-    @abc.abstractmethod
-    def write_packet(self, q, pixel_data, ts_tai: int,
-                     nanosec: int, ts_utc: float, cycle_count: int) -> None: ...
-
-    @abc.abstractmethod
-    def close(self) -> None: ...
 
 class ScopeFormatter(logging.Formatter):
     """Custom formatter that ensures 'scope' always exists to avoid KeyErrors."""
@@ -41,14 +34,18 @@ _root_logger = logging.getLogger()
 for _h in _root_logger.handlers[:]:
     _root_logger.removeHandler(_h)
 
+
 _handler = logging.StreamHandler()
-_handler.setFormatter(ScopeFormatter(
-    fmt='%(asctime)s [%(scope)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-))
+
+_formatter = ScopeFormatter(
+    fmt='%(asctime)s [%(levelname)s] [%(scope)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%SZ'
+)
+_formatter.converter = time.gmtime  # Use UTC
+_handler.setFormatter(_formatter)
 _root_logger.addHandler(_handler)
 _root_logger.setLevel(logging.INFO)
-logger = logging.getLogger('capture_pedestals')
+logger = logging.getLogger('capture_pedestal_events')
 
 MAX_FREQUENCY = 1000   # Hard upper limit (Hz)
 MIN_TIMEOUT   = 0.002  # Hard lower limit on auto-computed timeout (seconds)
@@ -96,6 +93,27 @@ SITES = {
         'use_ports': True
     },
 }
+
+class DataWriter(abc.ABC):
+    @abc.abstractmethod
+    def write_packet(self, q, pixel_data, ts_tai: int,
+                     nanosec: int, ts_utc: float, cycle_count: int) -> None: ...
+
+    @abc.abstractmethod
+    def close(self) -> None: ...
+
+def templated_filename(template: str, site_info: str, ts_utc: float) -> str:
+    dt = datetime.datetime.fromtimestamp(
+        ts_utc,
+        tz=datetime.timezone.utc
+    )
+    return template.format(
+            scope=site_info['scope'], 
+            date=dt.strftime('%Y%m%d'), 
+            time=dt.strftime('%H%M%S'),
+            isotime=dt.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            module=site_info['module_id']
+        )
 
 ###################################################################################################
 #
@@ -421,9 +439,7 @@ class PcapngWriter(DataWriter):
             self._flush_buffer_to_queue()
 
             dt = datetime.datetime.fromtimestamp(ts_utc)
-            filename = self.template.format(
-                scope=self.scope, date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
-            )
+            filename = templated_filename(self.template, self.site_info, ts_utc)
             self._enqueue_item(("ROLLOVER", filename))
             self.last_rollover_mono = mono
 
@@ -1022,6 +1038,11 @@ async def main():
     if not isinstance(numeric_level, int):
         parser.error(f'Invalid log level: {args.log_level}')
     logging.getLogger().setLevel(numeric_level)
+
+    if args.site not in SITES:
+        parser.error(f"Invalid site: {args.site}. Valid options are: {', '.join(SITES.keys())}")    
+
+    logger.info(f"Initializing pedestal event capture for {SITES[args.site]['scope']} (PID: {os.getpid()})")
 
     generator = PedestalGenerator(args)
     await generator.run()
