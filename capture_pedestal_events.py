@@ -96,13 +96,19 @@ SITES = {
 
 class DataWriter(abc.ABC):
     @abc.abstractmethod
+    def start(self, loop) -> None: ...
+
+    @abc.abstractmethod
     def write_packet(self, q, pixel_data, ts_tai: int,
                      nanosec: int, ts_utc: float, cycle_count: int) -> None: ...
 
     @abc.abstractmethod
+    def read_and_reset_dropped_packet_count(self) -> int: ...
+
+    @abc.abstractmethod
     def close(self) -> None: ...
 
-def templated_filename(template: str, site_info: str, ts_utc: float) -> str:
+def templated_filename(template: str, site_info: str, ts_utc: float, seq_id: int) -> str:
     dt = datetime.datetime.fromtimestamp(
         ts_utc,
         tz=datetime.timezone.utc
@@ -112,7 +118,8 @@ def templated_filename(template: str, site_info: str, ts_utc: float) -> str:
             date=dt.strftime('%Y%m%d'), 
             time=dt.strftime('%H%M%S'),
             isotime=dt.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            module=site_info['module_id']
+            module=site_info['module_id'],
+            seqid=seq_id
         )
 
 ###################################################################################################
@@ -204,6 +211,7 @@ class PcapngWriter(DataWriter):
 
         # Internal state
         self.last_rollover_mono = 0
+        self.file_seq_id = 0
         self.packets_written_total = 0
         self.current_filename = None
         self.file_handle = None
@@ -267,6 +275,10 @@ class PcapngWriter(DataWriter):
     def start(self, loop):
         """Starts the background writer task."""
         self.writer_task = loop.create_task(self._disk_writer())
+        def _on_writer_done(task):
+            if not task.cancelled() and task.exception() is not None:
+                self.logger.critical(f"[PCAP] Writer task died with exception: {task.exception()}")
+        self.writer_task.add_done_callback(_on_writer_done)
 
     async def _disk_writer(self):
         """Dedicated coroutine handling ALL disk I/O."""
@@ -439,9 +451,10 @@ class PcapngWriter(DataWriter):
             self._flush_buffer_to_queue()
 
             dt = datetime.datetime.fromtimestamp(ts_utc)
-            filename = templated_filename(self.template, self.site_info, ts_utc)
+            filename = templated_filename(self.template, self.site_info, ts_utc, self.file_seq_id)
             self._enqueue_item(("ROLLOVER", filename))
             self.last_rollover_mono = mono
+            self.file_seq_id += 1
 
     def _enqueue_item(self, item):
         cmd, payload = item
@@ -455,7 +468,7 @@ class PcapngWriter(DataWriter):
             self.pending_data_count += 1            
         self.write_queue.put_nowait(item)
 
-    def drain_miss_count(self) -> int:
+    def read_and_reset_dropped_packet_count(self) -> int:
         count = self.disk_misses_since_last_report
         self.disk_misses_since_last_report = 0
         return count
@@ -502,8 +515,14 @@ class PffWriter(DataWriter):
         self.max_size_mb = max_size_mb
         self.logger = logger
 
+    def start(self, loop) -> None:
+        pass
+
     def write_packet(self, q, pixel_data, ts_tai, nanosec, ts_utc, cycle_count) -> None:
         self.logger.debug("PffWriter: write_packet (stub)")
+
+    def read_and_reset_dropped_packet_count(self) -> int:
+        return 0
 
     def close(self) -> None:
         pass
@@ -527,14 +546,23 @@ class QuaboManager(asyncio.DatagramProtocol):
     def __init__(self):
         self.transport = None
         self.pending_requests = {}  # (ip, port) -> Future
+        self._sock_fd = None  # raw socket file descriptor (for drain operations)
 
     def connection_made(self, transport):
         self.transport = transport
+        self._sock_fd = transport.get_extra_info('socket').fileno()
 
     def datagram_received(self, data, addr):
         future = self.pending_requests.pop(addr, None)
         if future and not future.done():
             future.set_result(data)
+
+    def _drain_socket(self):
+        try:
+            while True:
+                os.read(self._sock_fd, 4096) # ugh!
+        except BlockingIOError:
+            pass
 
     def send_all(self, quabos):
         """
@@ -545,6 +573,7 @@ class QuaboManager(asyncio.DatagramProtocol):
 
         Must be called from the event loop thread (i.e. not from an executor).
         """
+        self._drain_socket()
         loop = asyncio.get_running_loop()
         futures = []
         for q in quabos:
@@ -753,8 +782,7 @@ class PedestalGenerator:
         # Gather disk misses from all writers
         disk_misses = 0
         for writer in self.writers:
-            if isinstance(writer, PcapngWriter):
-                disk_misses += writer.drain_miss_count()
+            disk_misses += writer.read_and_reset_dropped_packet_count()
 
         if is_final:
             total_activity = self.generated_since_last_report + self.dropped_cycles + sum(q.misses_since_last_report for q in self.quabos) + disk_misses
@@ -817,13 +845,7 @@ class PedestalGenerator:
         
         # Start background tasks with proper handles for clean shutdown
         for writer in self.writers:
-            if hasattr(writer, 'start'):
-                writer.start(loop)
-                if hasattr(writer, 'writer_task') and writer.writer_task:
-                    def _on_writer_done(task):
-                        if not task.cancelled() and task.exception() is not None:
-                            logger.critical(f"Writer task died with exception: {task.exception()}")
-                    writer.writer_task.add_done_callback(_on_writer_done)
+            writer.start(loop)
         
         self._watchdog_task = loop.create_task(self._watchdog())
 
