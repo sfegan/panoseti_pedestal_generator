@@ -19,6 +19,7 @@ import concurrent.futures
 import logging
 import array
 import abc
+import signal
 
 class DataWriter(abc.ABC):
     @abc.abstractmethod
@@ -181,10 +182,10 @@ class PcapngWriter(DataWriter):
         self.rollover = rollover
         self.buffer_max = buffer
         self.compute_checksums = compute_checksums
-        self.logger = logging.LoggerAdapter(logger, {'scope': f"{scope}] [PCAP"})
+        self.logger = logger
 
         # Internal state
-        self.last_rollover_sec = 0
+        self.last_rollover_mono = 0
         self.packets_written_total = 0
         self.current_filename = None
         self.file_handle = None
@@ -251,7 +252,7 @@ class PcapngWriter(DataWriter):
 
     async def _disk_writer(self):
         """Dedicated coroutine handling ALL disk I/O."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         
         while True:
             item = await self.write_queue.get()
@@ -274,11 +275,15 @@ class PcapngWriter(DataWriter):
                     try:
                         await loop.run_in_executor(self.executor, self._open_file, payload)
                     except Exception as e:
-                        self.logger.critical(f"Failed to open output file {payload}: {e}. Stopping PCAP writing.")
+                        self.logger.critical(f"[PCAP] Failed to open output file {payload}: {e}. Stopping PCAP writing.")
                         self.writer_failed = True
                         break
             except Exception as e:
-                self.logger.error(f"PCAP disk writer error: {e}")
+                self.logger.error(f"[PCAP] PCAP disk writer error: {e}")
+            except BaseException as e:
+                self.logger.critical(f"[PCAP] _disk_writer died: {type(e).__name__}: {e}", exc_info=True)
+                self.writer_failed = True
+                raise
             finally:
                 self.write_queue.task_done()
 
@@ -289,11 +294,11 @@ class PcapngWriter(DataWriter):
         self._write_shb()
         self._write_idb()
         self.file_handle.flush()
-        self.logger.info(f"Opened {filename}")
+        self.logger.info(f"[PCAP] Opened {filename}")
 
     def _close_current_file(self):
         if self.file_handle:
-            self.logger.info(f"Closing {self.current_filename}, {self.packets_in_current_file} packets written.")
+            self.logger.info(f"[PCAP] Closing {self.current_filename}, {self.packets_in_current_file} packets written.")
             self.file_handle.close()
             self.file_handle = None
             self.current_filename = None
@@ -341,7 +346,7 @@ class PcapngWriter(DataWriter):
             return
 
         # Check for rollover
-        self._manage_rollover(int(ts_utc))
+        self._manage_rollover(ts_utc)
 
         # Assemble EPB
         ptr = self.buffer_ptr
@@ -408,8 +413,9 @@ class PcapngWriter(DataWriter):
         self.buffer_count = 0
 
     def _manage_rollover(self, ts_utc):
-        is_due = (self.last_rollover_sec == 0 or 
-                  (self.rollover > 0 and ts_utc - self.last_rollover_sec >= self.rollover))
+        mono = time.monotonic()
+        is_due = (self.last_rollover_mono == 0 or 
+                  (self.rollover > 0 and mono - self.last_rollover_mono >= self.rollover))
 
         if is_due:
             self._flush_buffer_to_queue()
@@ -419,7 +425,7 @@ class PcapngWriter(DataWriter):
                 scope=self.scope, date=dt.strftime('%Y%m%d'), time=dt.strftime('%H%M%S')
             )
             self._enqueue_item(("ROLLOVER", filename))
-            self.last_rollover_sec = ts_utc
+            self.last_rollover_mono = mono
 
     def _enqueue_item(self, item):
         cmd, payload = item
@@ -427,7 +433,7 @@ class PcapngWriter(DataWriter):
             if self.pending_data_count >= 100:
                 _, count = payload
                 if self.disk_misses_since_last_report == 0:
-                    self.logger.warning(f"PCAP write queue full — dropping {count} packets (further warnings suppressed)")
+                    self.logger.warning(f"[PCAP] PCAP write queue full — dropping {count} packets (further warnings suppressed)")
                 self.disk_misses_since_last_report += count
                 return
             self.pending_data_count += 1            
@@ -440,7 +446,7 @@ class PcapngWriter(DataWriter):
 
     def close(self) -> None:
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             loop_is_running = loop.is_running()
         except (RuntimeError, AttributeError):
             loop_is_running = False
@@ -523,7 +529,7 @@ class QuaboManager(asyncio.DatagramProtocol):
 
         Must be called from the event loop thread (i.e. not from an executor).
         """
-        loop    = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         futures = []
         for q in quabos:
             addr = (q.ip, q.port)
@@ -559,7 +565,7 @@ class QuaboManager(asyncio.DatagramProtocol):
         """
         # Create a single list of tasks. None values from send_all are 
         # converted to pre-completed futures that return None.
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         task_list = []
         for fut in futures:
             if fut is None:
@@ -770,7 +776,7 @@ class PedestalGenerator:
             self._print_watchdog_report(is_final=False)
 
     async def run(self):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         # Initialize the single shared socket
         self.transport, self.manager = await loop.create_datagram_endpoint(
             lambda: QuaboManager(),
@@ -797,6 +803,11 @@ class PedestalGenerator:
         for writer in self.writers:
             if hasattr(writer, 'start'):
                 writer.start(loop)
+                if hasattr(writer, 'writer_task') and writer.writer_task:
+                    def _on_writer_done(task):
+                        if not task.cancelled() and task.exception() is not None:
+                            logger.critical(f"Writer task died with exception: {task.exception()}")
+                    writer.writer_task.add_done_callback(_on_writer_done)
         
         self._watchdog_task = loop.create_task(self._watchdog())
 
@@ -915,7 +926,7 @@ class PedestalGenerator:
             
             try:
                 try:
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     loop_is_running = loop.is_running()
                 except (RuntimeError, AttributeError):
                     # Loop is not running (or we're not in an async context)
@@ -1016,16 +1027,15 @@ async def main():
     await generator.run()
 
 if __name__ == "__main__":
-    if hasattr(asyncio, 'run'):
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            logger.info("Shutting down pedestal capture...")
-    else:
-        loop = asyncio.get_event_loop()
-        try:
-            loop.run_until_complete(main())
-        except KeyboardInterrupt:
-            logger.info("Shutting down pedestal capture...")
-        finally:
-            loop.close()
+    def _sigterm_handler(signum, frame):
+        logger.warning("Received SIGTERM — shutting down")
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down pedestal capture...")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
