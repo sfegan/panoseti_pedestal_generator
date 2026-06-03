@@ -19,7 +19,7 @@ Pedestal events sample the baseline pixel amplitudes when no trigger is present.
 
 ## How It Works
 
-`capture_pedestal_events.py` polls a module of four Quabo boards (each processing 256 pixels), records the responses, and writes them to a `.pcapng` file for offline analysis. The script is designed to run at low frequencies during an observation, or at high frequencies (up to 1000 Hz) for dedicatedcalibration runs.
+`capture_pedestal_events.py` polls a module of four Quabo boards (each processing 256 pixels), records the responses, and writes them to a `.pcapng` file for offline analysis. The script is designed to run at low frequencies during an observation, or at high frequencies (up to 1000 Hz) for dedicated calibration runs.
 
 ### 1. Timing and Scheduling
 
