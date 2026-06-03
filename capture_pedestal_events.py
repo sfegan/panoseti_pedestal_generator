@@ -43,7 +43,7 @@ for _h in _root_logger.handlers[:]:
 
 _handler = logging.StreamHandler()
 _handler.setFormatter(ScopeFormatter(
-    fmt='%(asctime)s [%(levelname)s] [%(scope)s] %(message)s',
+    fmt='%(asctime)s [%(scope)s] [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 ))
 _root_logger.addHandler(_handler)
@@ -657,7 +657,7 @@ class PedestalGenerator:
                 quabos=self.quabos,
                 rollover=args.pcap_rollover,
                 buffer=args.pcap_buffer,
-                compute_checksums=args.compute_checksums,
+                compute_checksums=args.pcap_compute_checksums,
                 logger=self.logger
             ))
         if args.pff:
@@ -967,14 +967,14 @@ class PedestalGenerator:
 async def main():
     parser = argparse.ArgumentParser(description='PANOSETI Pedestal Capture')
     parser.add_argument('--site', '-s', required=True, choices=SITES.keys(), help='Telescope site')
-    parser.add_argument('--frequency', type=int, default=1, help=f'Polling frequency in Hz (1–{MAX_FREQUENCY}, or negative for 1/n Hz)')
+    parser.add_argument('--frequency', '-f', type=int, default=1, help=f'Polling frequency in Hz (1–{MAX_FREQUENCY}, or negative for 1/n Hz)')
     
     # PCAP options
     parser.add_argument('--pcap', action='store_true', help='Enable PCAP output (pcapng format)')
-    parser.add_argument('--pcap-output', default='pedestals_{scope}_{date}_{time}.pcapng', help='Filename template for PCAP files')
+    parser.add_argument('--pcap-output', '-o', default='pedestals_{scope}_{date}_{time}.pcapng', help='Filename template for PCAP files')
     parser.add_argument('--pcap-rollover', type=int, default=600, help='PCAP file rollover interval in seconds')
     parser.add_argument('--pcap-buffer', type=int, default=None, help='Number of packets to buffer before writing to disk. Default: frequency (clamped 60–1000)')
-    parser.add_argument('--compute-checksums', action='store_true', help='Compute IP/UDP checksums in PCAP output (CPU intensive)')
+    parser.add_argument('--pcap-compute-checksums', action='store_true', help='Compute IP/UDP checksums in PCAP output (CPU intensive)')
     
     # PFF options
     parser.add_argument('--pff', action='store_true', help='Enable PFF output')
@@ -991,7 +991,7 @@ async def main():
 
     # ---- Argument validation ----
     if not args.pcap and not args.pff:
-        parser.error('At least one output format must be selected (--pcap and/or --pff)')
+        args.pcap = True
 
     if not (-MAX_FREQUENCY <= args.frequency <= MAX_FREQUENCY):
         parser.error(f'--frequency must be between -{MAX_FREQUENCY} and {MAX_FREQUENCY}')
