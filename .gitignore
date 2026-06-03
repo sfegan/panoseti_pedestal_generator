@@ -2,6 +2,7 @@
 *.csv
 *.dat
 *.log
+*.pff
 *.pcapng
 
 # Byte-compiled / optimized / DLL files

@@ -95,6 +95,10 @@ SITES = {
 }
 
 class DataWriter(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def name(self) -> str: ...
+
     @abc.abstractmethod
     def start(self, loop) -> None: ...
 
@@ -107,6 +111,9 @@ class DataWriter(abc.ABC):
 
     @abc.abstractmethod
     def close(self) -> None: ...
+
+    @abc.abstractmethod
+    async def join(self) -> None: ...
 
 def templated_filename(template: str, site_info: str, ts_utc: float, seq_id: int) -> str:
     dt = datetime.datetime.fromtimestamp(
@@ -139,6 +146,10 @@ class PcapngWriter(DataWriter):
     """
     Self-contained Pcapng writer with background I/O, buffering, and rollover.
     """
+    @property
+    def name(self) -> str:
+        return "PCAP"
+
     # PCAP constants
     _ETH_HDR_LEN    = 14
     _IP_HDR_LEN     = 20
@@ -197,17 +208,16 @@ class PcapngWriter(DataWriter):
         # RFC 768: If computed checksum is 0, transmit as 0xffff (all ones)
         return cksum if cksum != 0 else 0xffff
 
-    def __init__(self, template: str, scope: str, site_info: dict,
+    def __init__(self, template: str, site_info: dict,
                  quabos: list, rollover: int, buffer: int,
                  compute_checksums: bool, logger) -> None:
         self.template = template
-        self.scope = scope
         self.site_info = site_info
         self.quabos = quabos
         self.rollover = rollover
         self.buffer_max = buffer
         self.compute_checksums = compute_checksums
-        self.logger = logger
+        self.logger = logging.LoggerAdapter(logger, {'scope': site_info['scope']})
 
         # Internal state
         self.last_rollover_mono = 0
@@ -274,6 +284,8 @@ class PcapngWriter(DataWriter):
 
     def start(self, loop):
         """Starts the background writer task."""
+        rollover_str = f"{self.rollover}s" if self.rollover > 0 else "disabled"
+        self.logger.info(f"[PCAP] Starting writer: pattern=\"{self.template}\", rollover={rollover_str}, buffer={self.buffer_max}")
         self.writer_task = loop.create_task(self._disk_writer())
         def _on_writer_done(task):
             if not task.cancelled() and task.exception() is not None:
@@ -495,6 +507,13 @@ class PcapngWriter(DataWriter):
             # We must shutdown the executor here to at least try to flush.
             self.executor.shutdown(wait=True)
 
+    async def join(self) -> None:
+        if self.writer_task:
+            try:
+                await asyncio.wait_for(self.writer_task, timeout=5.0)
+            except (asyncio.TimeoutError, RuntimeError, asyncio.CancelledError):
+                pass
+
 ###################################################################################################
 #
 #    8888888b.  8888888888 8888888888 
@@ -509,23 +528,313 @@ class PcapngWriter(DataWriter):
 ###################################################################################################
 
 class PffWriter(DataWriter):
-    def __init__(self, template: str, scope: str, max_size_mb: int, logger) -> None:
-        self.template = template
-        self.scope = scope
-        self.max_size_mb = max_size_mb
-        self.logger = logger
+    """
+    Writer for PANOSETI File Format (PFF) with background I/O and size-based rollover.
+    Assembles four quabo packets into a single 1024-pixel module event.
+    """
+    @property
+    def name(self) -> str:
+        return "PFF"
 
-    def start(self, loop) -> None:
-        pass
+    # Constants
+    _QUABO_DIM     = 16          # 16×16 pixels per quabo
+    _MODULE_DIM    = 32          # 32×32 pixels per module
+    _QUABO_PIXELS  = 256        # 16×16
+    _MODULE_PIXELS = 1024      # 32×32
+    _PIXEL_BYTES   = 2          # int16 = 2 bytes
+    _QUABO_DATA_LEN = 512      # bytes per quabo payload
+    _IMAGE_DATA_LEN = 2048     # bytes for full module image
+    _JSON_TOTAL_LEN = 492      # bytes for JSON block including \n\n
+    _IMAGE_BLOCK_LEN = 2049    # 1 marker byte + 2048 data bytes
+    _EVENT_TOTAL_LEN = 2541    # _JSON_TOTAL_LEN + _IMAGE_BLOCK_LEN
+
+    def __init__(self, template: str, site_info: dict, max_size_bytes: int,
+                 buffer_events: int, logger) -> None:
+        self.template = template
+        self.site_info = site_info
+        self.max_size_bytes = max_size_bytes
+        self.buffer_events = buffer_events
+        self.logger = logging.LoggerAdapter(logger, {'scope': site_info['scope']})
+
+        # Event assembly state
+        self.pending_event = {}    # quabo_idx -> (pixel_data, ts_tai, nanosec, ts_utc, cycle_count)
+        self.pending_cycle = None
+
+        # In-memory buffer
+        self.buffer = bytearray(self._EVENT_TOTAL_LEN * self.buffer_events)
+        self.buffer_ptr = 0
+        self.buffer_count = 0
+
+        # File state
+        self.file_handle = None
+        self.current_filename = None
+        self.file_seq_id = 0
+        self.bytes_written_in_file = 0
+        self.events_written_total = 0
+
+        # Background I/O
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.write_queue = asyncio.Queue()
+        self.pending_data_count = 0
+        self.disk_misses_since_last_report = 0
+        self.writer_task = None
+        self.writer_failed = False
+
+    def start(self, loop):
+        self.logger.info(f"[PFF] Starting writer: pattern=\"{self.template}\", rollover={self.max_size_bytes/(1024*1024):.0f}MB, buffer={self.buffer_events}")
+        self.writer_task = loop.create_task(self._disk_writer())
+        def _on_writer_done(task):
+            if not task.cancelled() and task.exception() is not None:
+                self.logger.critical(f"[PFF] Writer task died with exception: {task.exception()}")
+        self.writer_task.add_done_callback(_on_writer_done)
+
+    async def _disk_writer(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            item = await self.write_queue.get()
+            if item is None: # Shutdown sentinel
+                self._close_current_file()
+                self.write_queue.task_done()
+                self.executor.shutdown(wait=True)
+                break
+                
+            cmd, payload = item
+            if cmd == "DATA":
+                self.pending_data_count -= 1
+            try:
+                if cmd == "DATA" and self.file_handle:
+                    data, count = payload
+                    await loop.run_in_executor(self.executor, self._write_raw, data, count)
+                elif cmd == "ROLLOVER":
+                    self._close_current_file()
+                    try:
+                        await loop.run_in_executor(self.executor, self._open_file, payload)
+                    except Exception as e:
+                        self.logger.critical(f"[PFF] Failed to open output file {payload}: {e}. Stopping PFF writing.")
+                        self.writer_failed = True
+                        break
+            except Exception as e:
+                self.logger.error(f"[PFF] PFF disk writer error: {e}")
+            except BaseException as e:
+                self.logger.critical(f"[PFF] _disk_writer died: {type(e).__name__}: {e}", exc_info=True)
+                self.writer_failed = True
+                raise
+            finally:
+                self.write_queue.task_done()
+
+    def _open_file(self, filename):
+        self.current_filename = filename
+        self.file_handle = open(filename, 'wb')
+        self.logger.info(f"[PFF] Opened {filename}")
+
+    def _close_current_file(self):
+        if self.file_handle:
+            self.logger.info(f"[PFF] Closing {self.current_filename}, {self.events_written_total} events written total.")
+            self.file_handle.close()
+            self.file_handle = None
+            self.current_filename = None
+
+    def _write_raw(self, data, count):
+        if self.file_handle:
+            self.file_handle.write(data)
+            self.file_handle.flush()
+            self.bytes_written_in_file += len(data)
+            self.events_written_total += count
 
     def write_packet(self, q, pixel_data, ts_tai, nanosec, ts_utc, cycle_count) -> None:
-        self.logger.debug("PffWriter: write_packet (stub)")
+        if self.writer_failed:
+            return
+
+        quabo_idx = q.idx
+
+        # Event boundary detection
+        if self.pending_cycle is not None and cycle_count != self.pending_cycle:
+            missing = set(range(4)) - set(self.pending_event.keys())
+            self.logger.debug(f"[PFF] Incomplete event for cycle {self.pending_cycle} (missing quabos {missing}), discarding.")
+            self.disk_misses_since_last_report += len(self.pending_event)
+            self.pending_event = {}
+            self.pending_cycle = None
+
+        if self.pending_cycle is None:
+            self.pending_cycle = cycle_count
+
+        self.pending_event[quabo_idx] = (bytes(pixel_data), ts_tai, nanosec, ts_utc, cycle_count)
+
+        if len(self.pending_event) < 4:
+            return
+
+        self._assemble_and_commit()
+        self.pending_event = {}
+        self.pending_cycle = None
+
+    def _assemble_and_commit(self):
+        # All quabos in a software-triggered event have same timing
+        _, ts_tai, nanosec, ts_utc, cycle_count = self.pending_event[0]
+
+        self._manage_rollover(ts_utc)
+
+        ptr = self.buffer_ptr
+        
+        # 1. Build and write the 492-byte JSON block
+        json_bytes = self._build_json_block(ts_tai, nanosec, ts_utc, cycle_count)
+        self.buffer[ptr:ptr + self._JSON_TOTAL_LEN] = json_bytes
+        ptr += self._JSON_TOTAL_LEN
+
+        # 2. Write the binary image block: '*' marker + 2048-byte rotated image
+        self.buffer[ptr] = 0x2A # '*'
+        ptr += 1
+        self._build_module_image(self.buffer, ptr)
+        ptr += self._IMAGE_DATA_LEN
+
+        self.buffer_ptr = ptr
+        self.buffer_count += 1
+
+        if self.buffer_count >= self.buffer_events:
+            self._flush_buffer_to_queue()
+
+    def _build_json_block(self, ts_tai, nanosec, ts_utc, cycle_count) -> bytes:
+        pkt_num  = cycle_count % 1000000
+        pkt_tai  = ts_tai % 10000
+        pkt_nsec = nanosec % 1000000000
+        tv_sec   = int(ts_utc) % 10000000000
+        tv_usec  = int((ts_utc % 1.0) * 1_000_000) % 1000000
+
+        def quabo_line(name, comma):
+            tail = ', ' if comma else ' '
+            return (
+                f'   "{name}": {{'
+                f' "pkt_num": {pkt_num:6d},'
+                f' "pkt_tai": {pkt_tai:4d},'
+                f' "pkt_nsec": {pkt_nsec:9d},'
+                f' "tv_sec": {tv_sec:10d},'
+                f' "tv_usec": {tv_usec:6d} }}{tail}\n'
+            )
+
+        body_lines = (
+            '{\n' +
+            quabo_line('quabo_0', comma=True) +
+            quabo_line('quabo_1', comma=True) +
+            quabo_line('quabo_2', comma=True) +
+            quabo_line('quabo_3', comma=False)
+        )
+        
+        # Padded to exactly 490 bytes total including final '}'
+        # Current length of body_lines is around 478-480.
+        target_content = 490
+        padding_needed = target_content - len(body_lines) - 1 # -1 for the '}'
+        if padding_needed < 0:
+             raise ValueError(f"[PFF] JSON body too long: {len(body_lines)+1} bytes (expected <= {target_content})")
+        
+        body = body_lines + (' ' * padding_needed) + '}'
+
+        result = (body + '\n\n').encode('utf-8')
+        assert len(result) == self._JSON_TOTAL_LEN, f"JSON block length mismatch: {len(result)}"
+        return result
+
+    def _build_module_image(self, buf, offset):
+        """
+        Rotate and assemble the four 16×16 quabo images into a 32×32 module 
+        image, writing int16 little-endian values directly into buf at offset.
+        """
+        for iquabo, (pixel_bytes, *_) in self.pending_event.items():
+            src = memoryview(pixel_bytes).cast('h')
+
+            if iquabo == 0:
+                for i in range(16):
+                    for j in range(16):
+                        out_row, out_col = j, 15 - i
+                        dst_idx = out_row * 32 + out_col
+                        struct.pack_into('<h', buf, offset + dst_idx * 2, src[i * 16 + j])
+            elif iquabo == 1:
+                for i in range(16):
+                    for j in range(16):
+                        out_row, out_col = 15 - i, 31 - j
+                        dst_idx = out_row * 32 + out_col
+                        struct.pack_into('<h', buf, offset + dst_idx * 2, src[i * 16 + j])
+            elif iquabo == 2:
+                for i in range(16):
+                    for j in range(16):
+                        out_row, out_col = 31 - j, 16 + i
+                        dst_idx = out_row * 32 + out_col
+                        struct.pack_into('<h', buf, offset + dst_idx * 2, src[i * 16 + j])
+            elif iquabo == 3:
+                for i in range(16):
+                    for j in range(16):
+                        out_row, out_col = 16 + i, j
+                        dst_idx = out_row * 32 + out_col
+                        struct.pack_into('<h', buf, offset + dst_idx * 2, src[i * 16 + j])
+
+    def _manage_rollover(self, ts_utc):
+        if self.file_seq_id == 0:
+            self._open_new_file(ts_utc)
+            return
+
+        # total so far = bytes already queued for disk + bytes in local buffer
+        total_so_far = self.bytes_written_in_file + self.buffer_ptr
+        projected = total_so_far + self._EVENT_TOTAL_LEN
+        
+        if total_so_far > 0 and projected > self.max_size_bytes:
+            self._flush_buffer_to_queue()
+            self._open_new_file(ts_utc)
+            self.bytes_written_in_file = 0
+
+    def _open_new_file(self, ts_utc):
+        filename = templated_filename(self.template, self.site_info, ts_utc, self.file_seq_id)
+        self._enqueue_item(("ROLLOVER", filename))
+        self.file_seq_id += 1
+
+    def _flush_buffer_to_queue(self):
+        if self.buffer_count == 0:
+            return
+        data = bytes(self.buffer[:self.buffer_ptr])
+        self.bytes_written_in_file += len(data)
+        self._enqueue_item(("DATA", (data, self.buffer_count)))
+        self.buffer_ptr = 0
+        self.buffer_count = 0
+
+    def _enqueue_item(self, item):
+        cmd, payload = item
+        if cmd == "DATA":
+            if self.pending_data_count >= 100:
+                _, count = payload
+                if self.disk_misses_since_last_report == 0:
+                    self.logger.warning(f"[PFF] Write queue full — dropping {count} events (further warnings suppressed)")
+                self.disk_misses_since_last_report += count
+                return
+            self.pending_data_count += 1            
+        self.write_queue.put_nowait(item)
 
     def read_and_reset_dropped_packet_count(self) -> int:
-        return 0
+        count = self.disk_misses_since_last_report
+        self.disk_misses_since_last_report = 0
+        return count
 
     def close(self) -> None:
-        pass
+        try:
+            loop = asyncio.get_running_loop()
+            loop_is_running = loop.is_running()
+        except (RuntimeError, AttributeError):
+            loop_is_running = False
+        
+        if loop_is_running:
+            try:
+                self._flush_buffer_to_queue()
+                self.write_queue.put_nowait(None)
+            except (RuntimeError, asyncio.QueueFull):
+                pass
+        else:
+            if self.buffer_count > 0:
+                data = bytes(self.buffer[:self.buffer_ptr])
+                self.write_queue.put_nowait(("DATA", (data, self.buffer_count)))
+            self.write_queue.put_nowait(None)
+            self.executor.shutdown(wait=True)
+
+    async def join(self) -> None:
+        if self.writer_task:
+            try:
+                await asyncio.wait_for(self.writer_task, timeout=5.0)
+            except (asyncio.TimeoutError, RuntimeError, asyncio.CancelledError):
+                pass
 
 ###################################################################################################
 #
@@ -654,6 +963,7 @@ class QuaboClient:
         self.ip = ip
         self.port = port
         self.quadrant = quadrant
+        self.idx = quadrant
         self.total_missing = 0
         self.consecutive_misses = 0
         self.is_down = False
@@ -697,7 +1007,6 @@ class PedestalGenerator:
         if args.pcap:
             self.writers.append(PcapngWriter(
                 template=args.pcap_output,
-                scope=self.scope,
                 site_info=self.site_info,
                 quabos=self.quabos,
                 rollover=args.pcap_rollover,
@@ -706,10 +1015,16 @@ class PedestalGenerator:
                 logger=self.logger
             ))
         if args.pff:
+            pff_buffer = args.pff_buffer
+            if pff_buffer is None:
+                freq = abs(args.frequency) if args.frequency != 0 else 1
+                pff_buffer = max(10, min(500, freq))
+            
             self.writers.append(PffWriter(
                 template=args.pff_output,
-                scope=self.scope,
-                max_size_mb=args.pff_max_size,
+                site_info=self.site_info,
+                max_size_bytes=args.pff_max_size * 1024 * 1024,
+                buffer_events=pff_buffer,
                 logger=self.logger
             ))
         
@@ -780,12 +1095,16 @@ class PedestalGenerator:
 
     def _print_watchdog_report(self, is_final=False):
         # Gather disk misses from all writers
-        disk_misses = 0
+        writer_misses = []
+        total_disk_misses = 0
         for writer in self.writers:
-            disk_misses += writer.read_and_reset_dropped_packet_count()
+            m = writer.read_and_reset_dropped_packet_count()
+            if m > 0:
+                writer_misses.append(f"{writer.name}: {m}")
+            total_disk_misses += m
 
         if is_final:
-            total_activity = self.generated_since_last_report + self.dropped_cycles + sum(q.misses_since_last_report for q in self.quabos) + disk_misses
+            total_activity = self.generated_since_last_report + self.dropped_cycles + sum(q.misses_since_last_report for q in self.quabos) + total_disk_misses
             if total_activity == 0:
                 return
             
@@ -794,9 +1113,8 @@ class PedestalGenerator:
             if q.misses_since_last_report > 0:
                 miss_reports.append(f"Q{i}: {q.misses_since_last_report}")
         
-        # Add disk drops to miss reports
-        if disk_misses > 0:
-            miss_reports.append(f"Disk: {disk_misses}")
+        # Add writer drops to miss reports
+        miss_reports.extend(writer_misses)
         
         if not miss_reports:
             miss_str = "no missed packets"
@@ -976,12 +1294,12 @@ class PedestalGenerator:
                 
                 if loop_is_running:
                     # Wait for writer tasks to finish if possible
-                    tasks = [w.writer_task for w in self.writers if isinstance(w, PcapngWriter) and w.writer_task]
+                    tasks = [writer.join() for writer in self.writers]
                     if tasks:
                         try:
                             # In this 'finally' block, we are usually still in the coroutine.
-                            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
-                        except (asyncio.TimeoutError, RuntimeError, asyncio.CancelledError):
+                            await asyncio.gather(*tasks)
+                        except (RuntimeError, asyncio.CancelledError):
                             pass
                     
                     # Clean up the watchdog task
@@ -1018,6 +1336,7 @@ async def main():
     parser.add_argument('--pff', action='store_true', help='Enable PFF output')
     parser.add_argument('--pff-output', default='pedestals_{scope}_{date}_{time}.pff', help='Filename template for PFF files')
     parser.add_argument('--pff-max-size', type=int, default=1024, help='PFF file size rollover threshold in MB')
+    parser.add_argument('--pff-buffer', type=int, default=None, help='Number of events to buffer before writing (default: auto)')
 
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--bind-port', type=int, default=0, help='Local UDP port to bind to (0 for random)')
