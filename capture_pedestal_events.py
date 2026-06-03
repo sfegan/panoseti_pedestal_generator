@@ -537,16 +537,16 @@ class PffWriter(DataWriter):
         return "PFF"
 
     # Constants
-    _QUABO_DIM     = 16          # 16×16 pixels per quabo
-    _MODULE_DIM    = 32          # 32×32 pixels per module
+    _QUABO_DIM     = 16         # 16×16 pixels per quabo
+    _MODULE_DIM    = 32         # 32×32 pixels per module
     _QUABO_PIXELS  = 256        # 16×16
-    _MODULE_PIXELS = 1024      # 32×32
+    _MODULE_PIXELS = 1024       # 32×32
     _PIXEL_BYTES   = 2          # int16 = 2 bytes
-    _QUABO_DATA_LEN = 512      # bytes per quabo payload
-    _IMAGE_DATA_LEN = 2048     # bytes for full module image
-    _JSON_TOTAL_LEN = 492      # bytes for JSON block including \n\n
-    _IMAGE_BLOCK_LEN = 2049    # 1 marker byte + 2048 data bytes
-    _EVENT_TOTAL_LEN = 2541    # _JSON_TOTAL_LEN + _IMAGE_BLOCK_LEN
+    _QUABO_DATA_LEN = 512       # bytes per quabo payload
+    _IMAGE_DATA_LEN = 2048      # bytes for full module image
+    _JSON_TOTAL_LEN = 491       # bytes for JSON block including \n\n
+    _IMAGE_BLOCK_LEN = 2049     # 1 marker byte + 2048 data bytes
+    _EVENT_TOTAL_LEN = 2540     # _JSON_TOTAL_LEN + _IMAGE_BLOCK_LEN
 
     def __init__(self, template: str, site_info: dict, max_size_bytes: int,
                  buffer_events: int, logger) -> None:
@@ -695,37 +695,31 @@ class PffWriter(DataWriter):
     def _build_json_block(self, ts_tai, nanosec, ts_utc, cycle_count) -> bytes:
         pkt_num  = cycle_count % 1000000
         pkt_tai  = ts_tai % 10000
-        pkt_nsec = nanosec % 1000000000
-        tv_sec   = int(ts_utc) % 10000000000
+        pkt_nsec = nanosec % 1000_000_000
+        tv_sec   = int(ts_utc) % 1000_000_0000
         tv_usec  = int((ts_utc % 1.0) * 1_000_000) % 1000000
 
         def quabo_line(name, comma):
-            tail = ', ' if comma else ' '
+            tail = ', ' if comma else ''
             return (
                 f'   "{name}": {{'
-                f' "pkt_num": {pkt_num:6d},'
+                f' "pkt_num": {pkt_num:10d},'
                 f' "pkt_tai": {pkt_tai:4d},'
                 f' "pkt_nsec": {pkt_nsec:9d},'
                 f' "tv_sec": {tv_sec:10d},'
-                f' "tv_usec": {tv_usec:6d} }}{tail}\n'
+                f' "tv_usec": {tv_usec:6d}}}{tail}\n'
             )
 
         body_lines = (
             '{\n' +
-            quabo_line('quabo_0', comma=True) +
-            quabo_line('quabo_1', comma=True) +
-            quabo_line('quabo_2', comma=True) +
-            quabo_line('quabo_3', comma=False)
+                quabo_line('quabo_0', comma=True) +
+                quabo_line('quabo_1', comma=True) +
+                quabo_line('quabo_2', comma=True) +
+                quabo_line('quabo_3', comma=False) +
+            '}'
         )
-        
-        # Padded to exactly 490 bytes total including final '}'
-        # Current length of body_lines is around 478-480.
-        target_content = 490
-        padding_needed = target_content - len(body_lines) - 1 # -1 for the '}'
-        if padding_needed < 0:
-             raise ValueError(f"[PFF] JSON body too long: {len(body_lines)+1} bytes (expected <= {target_content})")
-        
-        body = body_lines + (' ' * padding_needed) + '}'
+                
+        body = body_lines + '}'
 
         result = (body + '\n\n').encode('utf-8')
         assert len(result) == self._JSON_TOTAL_LEN, f"JSON block length mismatch: {len(result)}"
@@ -1228,7 +1222,7 @@ class PedestalGenerator:
                     self.logger.debug(f"Starting cycle {slot}, target trigger time: {trigger_wall:.3f}")
 
                 ts_utc = trigger_wall
-                ts_tai = int(ts_utc) + self.args.tai_offset
+                ts_tai = (int(ts_utc) + self.args.tai_offset) % 1024
                 # Calculate nanoseconds within the current wall-clock second
                 nanosec = int(round((trigger_wall % 1.0) * 1_000_000_000))
 
