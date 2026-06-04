@@ -595,20 +595,17 @@ class PffWriter(DataWriter):
     async def _disk_writer(self):
         loop = asyncio.get_running_loop()
         while True:
-            item = await self.write_queue.get()
-            if item is None: # Shutdown sentinel
+            payload = await self.write_queue.get()
+            if payload is None: # Shutdown sentinel
                 self._close_current_file()
                 self.write_queue.task_done()
                 self.executor.shutdown(wait=True)
                 break
                 
-            cmd, payload = item
-            if cmd == "DATA":
-                self.pending_data_count -= 1
+            self.pending_data_count -= 1
             try:
-                if cmd == "DATA":
-                    data, count, ts_utc = payload
-                    await loop.run_in_executor(self.executor, self._check_file_and_write, data, count, ts_utc)
+                data, count, ts_utc = payload
+                await loop.run_in_executor(self.executor, self._check_file_and_write, data, count, ts_utc)
             except Exception as e:
                 self.logger.critical(f"[PFF] PFF disk writer critical error: {e}. Stopping PFF writing.")
                 self.writer_failed = True
@@ -628,7 +625,7 @@ class PffWriter(DataWriter):
 
     def _close_current_file(self):
         if self.file_handle:
-            self.logger.info(f"[PFF] Closing {self.current_filename}, {self.events_written_total} events written total.")
+            self.logger.info(f"[PFF] Closing {self.current_filename}, {self.events_written_total} events written.")
             self.file_handle.close()
             self.file_handle = None
             self.current_filename = None
@@ -638,6 +635,7 @@ class PffWriter(DataWriter):
             self._open_file(ts_utc)
         elif self.bytes_written_in_file > 0 and (self.bytes_written_in_file + len(data) > self.max_size_bytes):
             self._close_current_file()
+            self.events_written_total = 0
             self._open_file(ts_utc)
 
         if self.file_handle:
@@ -753,13 +751,12 @@ class PffWriter(DataWriter):
         if self.buffer_count == 0:
             return
         data = bytes(self.buffer[:self.buffer_ptr])
-        self._enqueue_item(("DATA", (data, self.buffer_count, self.buffer_first_ts_utc)))
+        self._enqueue_item((data, self.buffer_count, self.buffer_first_ts_utc))
         self.buffer_ptr = 0
         self.buffer_count = 0
 
-    def _enqueue_item(self, item):
-        cmd, payload = item
-        if cmd == "DATA":
+    def _enqueue_item(self, payload):
+        if payload is not None:
             if self.pending_data_count >= 100:
                 _, count, _ = payload
                 if self.disk_misses_since_last_report == 0:
@@ -767,7 +764,7 @@ class PffWriter(DataWriter):
                 self.disk_misses_since_last_report += count*4  # 4 quabos per event
                 return
             self.pending_data_count += 1            
-        self.write_queue.put_nowait(item)
+        self.write_queue.put_nowait(payload)
 
     def read_and_reset_dropped_packet_count(self) -> int:
         count = self.disk_misses_since_last_report
@@ -790,7 +787,7 @@ class PffWriter(DataWriter):
         else:
             if self.buffer_count > 0:
                 data = bytes(self.buffer[:self.buffer_ptr])
-                self.write_queue.put_nowait(("DATA", (data, self.buffer_count)))
+                self.write_queue.put_nowait((data, self.buffer_count, self.buffer_first_ts_utc))
             self.write_queue.put_nowait(None)
             self.executor.shutdown(wait=True)
 
