@@ -1215,7 +1215,11 @@ class PedestalGenerator:
                         q.consecutive_misses = 0
 
                         # Optimized in-place buffer assembly using memoryview to avoid copies
-                        view = memoryview(data)[_PKT_HEADER_OFFSET:_PKT_PAYLOAD_END]
+                        if self.args.test_card:
+                            # Overwrite payload with fixed pattern for testing output alignment
+                            view = struct.pack('<256H', *[idx*256 + i for i in range(256)])
+                        else:
+                            view = memoryview(data)[_PKT_HEADER_OFFSET:_PKT_PAYLOAD_END]
                         for writer in self.writers:
                             writer.write_packet(q, view, ts_tai, nanosec, ts_utc, self.cycle_count)
                     else:
@@ -1302,6 +1306,8 @@ async def main():
     parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/min(period, 1.0)))')
     parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
     parser.add_argument('--watchdog-period', type=int, default=60, help='Watchdog summary logging period in seconds')
+
+    parser.add_argument('--test-card', action='store_true', help='Replace all quabo data with a fixed test pattern (for testing PCAP/PFF output alignment)')
     args = parser.parse_args()
 
     # ---- Argument validation ----
