@@ -562,6 +562,7 @@ class PffWriter(DataWriter):
         self.pending_ts_tai = None
         self.pending_nanosec = None
         self.pending_ts_utc = None
+        self.buffer_first_ts_utc = None
 
         # In-memory buffer
         self.buffer = bytearray(self._EVENT_TOTAL_LEN * self.buffer_events)
@@ -605,30 +606,25 @@ class PffWriter(DataWriter):
             if cmd == "DATA":
                 self.pending_data_count -= 1
             try:
-                if cmd == "DATA" and self.file_handle:
-                    data, count = payload
-                    await loop.run_in_executor(self.executor, self._write_raw, data, count)
-                elif cmd == "ROLLOVER":
-                    self._close_current_file()
-                    try:
-                        await loop.run_in_executor(self.executor, self._open_file, payload)
-                    except Exception as e:
-                        self.logger.critical(f"[PFF] Failed to open output file {payload}: {e}. Stopping PFF writing.")
-                        self.writer_failed = True
-                        break
+                if cmd == "DATA":
+                    data, count, ts_utc = payload
+                    await loop.run_in_executor(self.executor, self._check_file_and_write, data, count, ts_utc)
             except Exception as e:
-                self.logger.error(f"[PFF] PFF disk writer error: {e}")
-            except BaseException as e:
-                self.logger.critical(f"[PFF] _disk_writer died: {type(e).__name__}: {e}", exc_info=True)
+                self.logger.critical(f"[PFF] PFF disk writer critical error: {e}. Stopping PFF writing.")
                 self.writer_failed = True
-                raise
+                self._close_current_file()
+                self.write_queue.task_done()
+                break
             finally:
                 self.write_queue.task_done()
 
-    def _open_file(self, filename):
+    def _open_file(self, ts_utc):
+        filename = templated_filename(self.template, self.site_info, ts_utc, self.file_seq_id)
         self.current_filename = filename
         self.file_handle = open(filename, 'wb')
         self.logger.info(f"[PFF] Opened {filename}")
+        self.bytes_written_in_file = 0
+        self.file_seq_id += 1
 
     def _close_current_file(self):
         if self.file_handle:
@@ -637,7 +633,13 @@ class PffWriter(DataWriter):
             self.file_handle = None
             self.current_filename = None
 
-    def _write_raw(self, data, count):
+    def _check_file_and_write(self, data, count, ts_utc):
+        if self.file_handle is None:
+            self._open_file(ts_utc)
+        elif self.bytes_written_in_file > 0 and (self.bytes_written_in_file + len(data) > self.max_size_bytes):
+            self._close_current_file()
+            self._open_file(ts_utc)
+
         if self.file_handle:
             self.file_handle.write(data)
             self.file_handle.flush()
@@ -662,12 +664,13 @@ class PffWriter(DataWriter):
 
         # Start of a new cycle
         if self.pending_cycle is None:
-            self._manage_rollover(ts_utc)
             self.pending_cycle = cycle_count
             self.arrived_quabos = 0
             self.pending_ts_tai = ts_tai
             self.pending_nanosec = nanosec
             self.pending_ts_utc = ts_utc
+            if self.buffer_count == 0:
+                self.buffer_first_ts_utc = ts_utc
 
         # Write this quabo's data directly to the active insertion point in the buffer
         offset = self.buffer_ptr + self._JSON_TOTAL_LEN + 1
@@ -746,31 +749,11 @@ class PffWriter(DataWriter):
         assert len(result) == self._JSON_TOTAL_LEN, f"JSON block length mismatch: {len(result)}"
         return result
 
-    def _manage_rollover(self, ts_utc):
-        if self.file_seq_id == 0:
-            self._open_new_file(ts_utc)
-            return
-
-        # total so far = bytes already queued for disk + bytes in local buffer
-        total_so_far = self.bytes_written_in_file + self.buffer_ptr
-        projected = total_so_far + self._EVENT_TOTAL_LEN
-        
-        if total_so_far > 0 and projected > self.max_size_bytes:
-            self._flush_buffer_to_queue()
-            self._open_new_file(ts_utc)
-            self.bytes_written_in_file = 0
-
-    def _open_new_file(self, ts_utc):
-        filename = templated_filename(self.template, self.site_info, ts_utc, self.file_seq_id)
-        self._enqueue_item(("ROLLOVER", filename))
-        self.file_seq_id += 1
-
     def _flush_buffer_to_queue(self):
         if self.buffer_count == 0:
             return
         data = bytes(self.buffer[:self.buffer_ptr])
-        self.bytes_written_in_file += len(data)
-        self._enqueue_item(("DATA", (data, self.buffer_count)))
+        self._enqueue_item(("DATA", (data, self.buffer_count, self.buffer_first_ts_utc)))
         self.buffer_ptr = 0
         self.buffer_count = 0
 
@@ -778,10 +761,10 @@ class PffWriter(DataWriter):
         cmd, payload = item
         if cmd == "DATA":
             if self.pending_data_count >= 100:
-                _, count = payload
+                _, count, _ = payload
                 if self.disk_misses_since_last_report == 0:
                     self.logger.warning(f"[PFF] Write queue full — dropping {count} events (further warnings suppressed)")
-                self.disk_misses_since_last_report += count
+                self.disk_misses_since_last_report += count*4  # 4 quabos per event
                 return
             self.pending_data_count += 1            
         self.write_queue.put_nowait(item)
@@ -1010,10 +993,6 @@ class PedestalGenerator:
                 logger=self.logger
             ))
         
-        if not self.writers:
-            # This should be caught by argparse validation, but just in case
-            raise ValueError("At least one output format must be selected (--pcap and/or --pff)")
-
         self._watchdog_task = None
 
         # Calculate effective polling period and trigger offset (phase)
@@ -1316,7 +1295,7 @@ async def main():
     
     # PFF options
     parser.add_argument('--pff', action='store_true', help='Enable PFF output')
-    parser.add_argument('--pff-output', default='pedestals_{scope}_{date}_{time}.pff', help='Filename template for PFF files')
+    parser.add_argument('--pff-output', default='start_{isotime}.dp_ped1024.bpp_2.module_{module}.seqno_{seqid}.pff', help='Filename template for PFF files')
     parser.add_argument('--pff-max-size', type=int, default=1024, help='PFF file size rollover threshold in MB')
     parser.add_argument('--pff-buffer', type=int, default=None, help='Number of events to buffer before writing (default: auto)')
 
@@ -1330,7 +1309,7 @@ async def main():
 
     # ---- Argument validation ----
     if not args.pcap and not args.pff:
-        args.pcap = True
+        logger.warning("No output format selected — packets will be discareded. Use --pcap and/or --pff to enable output.")
 
     if not (-MAX_FREQUENCY <= args.frequency <= MAX_FREQUENCY):
         parser.error(f'--frequency must be between -{MAX_FREQUENCY} and {MAX_FREQUENCY}')
