@@ -537,14 +537,14 @@ class PffWriter(DataWriter):
         return "PFF"
 
     # Constants
-    _QUABO_DIM     = 16         # 16×16 pixels per quabo
-    _MODULE_DIM    = 32         # 32×32 pixels per module
-    _QUABO_PIXELS  = 256        # 16×16
-    _MODULE_PIXELS = 1024       # 32×32
-    _PIXEL_BYTES   = 2          # int16 = 2 bytes
-    _QUABO_DATA_LEN = 512       # bytes per quabo payload
-    _IMAGE_DATA_LEN = 2048      # bytes for full module image
-    _JSON_TOTAL_LEN = 491       # bytes for JSON block including \n\n
+    _QUABO_DIM       = 16       # 16×16 pixels per quabo
+    _MODULE_DIM      = 32       # 32×32 pixels per module
+    _QUABO_PIXELS    = 256      # 16×16
+    _MODULE_PIXELS   = 1024     # 32×32
+    _PIXEL_BYTES     = 2        # int16 = 2 bytes
+    _QUABO_DATA_LEN  = 512      # bytes per quabo payload
+    _IMAGE_DATA_LEN  = 2048     # bytes for full module image
+    _JSON_TOTAL_LEN  = 491      # bytes for JSON block including \n\n
     _IMAGE_BLOCK_LEN = 2049     # 1 marker byte + 2048 data bytes
     _EVENT_TOTAL_LEN = 2540     # _JSON_TOTAL_LEN + _IMAGE_BLOCK_LEN
 
