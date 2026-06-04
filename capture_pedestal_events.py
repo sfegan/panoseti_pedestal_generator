@@ -557,8 +557,11 @@ class PffWriter(DataWriter):
         self.logger = logging.LoggerAdapter(logger, {'scope': site_info['scope']})
 
         # Event assembly state
-        self.pending_event = {}    # quabo_idx -> (pixel_data, ts_tai, nanosec, ts_utc, cycle_count)
         self.pending_cycle = None
+        self.arrived_quabos = 0
+        self.pending_ts_tai = None
+        self.pending_nanosec = None
+        self.pending_ts_utc = None
 
         # In-memory buffer
         self.buffer = bytearray(self._EVENT_TOTAL_LEN * self.buffer_events)
@@ -649,44 +652,63 @@ class PffWriter(DataWriter):
 
         # Event boundary detection
         if self.pending_cycle is not None and cycle_count != self.pending_cycle:
-            missing = set(range(4)) - set(self.pending_event.keys())
+            # Previous cycle was incomplete: count how many quabos arrived for it
+            arrived_count = bin(self.arrived_quabos).count('1')
+            missing = [idx for idx in range(4) if not (self.arrived_quabos & (1 << idx))]
             self.logger.debug(f"[PFF] Incomplete event for cycle {self.pending_cycle} (missing quabos {missing}), discarding.")
-            self.disk_misses_since_last_report += len(self.pending_event)
-            self.pending_event = {}
+            self.disk_misses_since_last_report += arrived_count
             self.pending_cycle = None
+            self.arrived_quabos = 0
 
+        # Start of a new cycle
         if self.pending_cycle is None:
+            self._manage_rollover(ts_utc)
             self.pending_cycle = cycle_count
+            self.arrived_quabos = 0
+            self.pending_ts_tai = ts_tai
+            self.pending_nanosec = nanosec
+            self.pending_ts_utc = ts_utc
 
-        self.pending_event[quabo_idx] = (bytes(pixel_data), ts_tai, nanosec, ts_utc, cycle_count)
+        # Write this quabo's data directly to the active insertion point in the buffer
+        offset = self.buffer_ptr + self._JSON_TOTAL_LEN + 1
+        image_view = memoryview(self.buffer)[offset : offset + self._IMAGE_DATA_LEN].cast('h')
+        
+        src = memoryview(pixel_data).cast('h')
+        
+        if quabo_idx == 0:
+            for j in range(16):
+                image_view[j * 32 : j * 32 + 16] = src[j::16][::-1]
+        elif quabo_idx == 1:
+            for i in range(16):
+                image_view[(15 - i) * 32 + 16 : (15 - i) * 32 + 32] = src[i * 16 : (i + 1) * 16][::-1]
+        elif quabo_idx == 2:
+            for j in range(16):
+                image_view[(31 - j) * 32 + 16 : (31 - j) * 32 + 32] = src[j::16]
+        elif quabo_idx == 3:
+            for i in range(16):
+                image_view[(16 + i) * 32 : (16 + i) * 32 + 16] = src[i * 16 : (i + 1) * 16]
 
-        if len(self.pending_event) < 4:
-            return
+        self.arrived_quabos |= (1 << quabo_idx)
 
-        self._assemble_and_commit()
-        self.pending_event = {}
-        self.pending_cycle = None
+        # Once all 4 quabos have arrived, finalize the event
+        if self.arrived_quabos == 0b1111:
+            self._assemble_and_commit()
+            self.pending_cycle = None
+            self.arrived_quabos = 0
 
     def _assemble_and_commit(self):
-        # All quabos in a software-triggered event have same timing
-        _, ts_tai, nanosec, ts_utc, cycle_count = self.pending_event[0]
-
-        self._manage_rollover(ts_utc)
-
         ptr = self.buffer_ptr
         
-        # 1. Build and write the 492-byte JSON block
-        json_bytes = self._build_json_block(ts_tai, nanosec, ts_utc, cycle_count)
-        self.buffer[ptr:ptr + self._JSON_TOTAL_LEN] = json_bytes
+        # 1. Build and write the 491-byte JSON block
+        json_bytes = self._build_json_block(self.pending_ts_tai, self.pending_nanosec, self.pending_ts_utc, self.pending_cycle)
+        self.buffer[ptr : ptr + self._JSON_TOTAL_LEN] = json_bytes
         ptr += self._JSON_TOTAL_LEN
 
-        # 2. Write the binary image block: '*' marker + 2048-byte rotated image
-        self.buffer[ptr] = 0x2A # '*'
-        ptr += 1
-        self._build_module_image(self.buffer, ptr)
-        ptr += self._IMAGE_DATA_LEN
-
-        self.buffer_ptr = ptr
+        # 2. Write the '*' marker
+        self.buffer[ptr] = 0x2A  # '*'
+        
+        # The image data is already in place at ptr + 1, so we just advance the pointer
+        self.buffer_ptr += self._EVENT_TOTAL_LEN
         self.buffer_count += 1
 
         if self.buffer_count >= self.buffer_events:
@@ -715,8 +737,7 @@ class PffWriter(DataWriter):
                 quabo_line('quabo_0', comma=True) +
                 quabo_line('quabo_1', comma=True) +
                 quabo_line('quabo_2', comma=True) +
-                quabo_line('quabo_3', comma=False) +
-            '}'
+                quabo_line('quabo_3', comma=False)
         )
                 
         body = body_lines + '}'
@@ -724,39 +745,6 @@ class PffWriter(DataWriter):
         result = (body + '\n\n').encode('utf-8')
         assert len(result) == self._JSON_TOTAL_LEN, f"JSON block length mismatch: {len(result)}"
         return result
-
-    def _build_module_image(self, buf, offset):
-        """
-        Rotate and assemble the four 16×16 quabo images into a 32×32 module 
-        image, writing int16 little-endian values directly into buf at offset.
-        """
-        for iquabo, (pixel_bytes, *_) in self.pending_event.items():
-            src = memoryview(pixel_bytes).cast('h')
-
-            if iquabo == 0:
-                for i in range(16):
-                    for j in range(16):
-                        out_row, out_col = j, 15 - i
-                        dst_idx = out_row * 32 + out_col
-                        struct.pack_into('<h', buf, offset + dst_idx * 2, src[i * 16 + j])
-            elif iquabo == 1:
-                for i in range(16):
-                    for j in range(16):
-                        out_row, out_col = 15 - i, 31 - j
-                        dst_idx = out_row * 32 + out_col
-                        struct.pack_into('<h', buf, offset + dst_idx * 2, src[i * 16 + j])
-            elif iquabo == 2:
-                for i in range(16):
-                    for j in range(16):
-                        out_row, out_col = 31 - j, 16 + i
-                        dst_idx = out_row * 32 + out_col
-                        struct.pack_into('<h', buf, offset + dst_idx * 2, src[i * 16 + j])
-            elif iquabo == 3:
-                for i in range(16):
-                    for j in range(16):
-                        out_row, out_col = 16 + i, j
-                        dst_idx = out_row * 32 + out_col
-                        struct.pack_into('<h', buf, offset + dst_idx * 2, src[i * 16 + j])
 
     def _manage_rollover(self, ts_utc):
         if self.file_seq_id == 0:
