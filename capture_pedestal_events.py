@@ -919,25 +919,6 @@ class QuaboManager(asyncio.DatagramProtocol):
 
         return results
 
-class CommandProtocol(asyncio.DatagramProtocol):
-    """Listens for remote control commands via UDP."""
-    def __init__(self, stop_callback, logger):
-        self.stop_callback = stop_callback
-        self.logger = logger
-        self.transport = None
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def datagram_received(self, data, addr):
-        msg = data.decode('utf-8', errors='ignore').strip()
-        if msg == "STOP":
-            self.logger.info(f"STOP command received from {addr}")
-            self.transport.sendto(b"STOPPING\n", addr)
-            self.stop_callback()
-        elif msg:
-            self.logger.debug(f"Received unknown command '{msg}' from {addr}")
-
 class QuaboClient:
     """Helper to track state for a single quabo board."""
     def __init__(self, ip, port, quadrant):
@@ -965,6 +946,25 @@ class QuaboClient:
 #     "Y8888P88  "Y8888  888  888  "Y8888  888    "Y888888  "Y888 "Y88P"  888     
 #
 ###################################################################################################
+
+class CommandProtocol(asyncio.DatagramProtocol):
+    """Listens for remote control commands via UDP."""
+    def __init__(self, stop_callback, logger):
+        self.stop_callback = stop_callback
+        self.logger = logger
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        msg = data.decode('utf-8', errors='ignore').strip()
+        if msg == "STOP":
+            self.logger.info(f"STOP command received from {addr}")
+            self.transport.sendto(b"STOPPING\n", addr)
+            self.stop_callback()
+        elif msg:
+            self.logger.debug(f"Received unknown command '{msg}' from {addr}")
 
 class PedestalGenerator:
     def __init__(self, args):
@@ -1349,6 +1349,7 @@ async def main():
     parser.add_argument('--data-port', type=int, default=0, help='Local UDP port to bind to for data (0 for random)')
     parser.add_argument('--command-port', type=int, default=0, help='UDP port to listen for control commands (0 to disable)')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
+    parser.add_argument('--log-file', help='Write log messages to this file')
     parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/min(period, 1.0)))')
     parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
     parser.add_argument('--watchdog-period', type=int, default=60, help='Watchdog summary logging period in seconds')
@@ -1388,7 +1389,19 @@ async def main():
     numeric_level = getattr(logging, args.log_level.upper(), None)
     if not isinstance(numeric_level, int):
         parser.error(f'Invalid log level: {args.log_level}')
-    logging.getLogger().setLevel(numeric_level)
+    
+    _root_logger = logging.getLogger()
+    _root_logger.setLevel(numeric_level)
+
+    if args.log_file:
+        _file_handler = logging.FileHandler(args.log_file)
+        _file_formatter = ScopeFormatter(
+            fmt='%(asctime)s [%(levelname)s] [%(scope)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%SZ'
+        )
+        _file_formatter.converter = time.gmtime
+        _file_handler.setFormatter(_file_formatter)
+        _root_logger.addHandler(_file_handler)
 
     if args.site not in SITES:
         parser.error(f"Invalid site: {args.site}. Valid options are: {', '.join(SITES.keys())}")    

@@ -106,6 +106,7 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 | `--pcap-buffer` | | *Int* | *Dynamic* | Packets to buffer before write (Default: 60 or frequency) |
 | `--compute-checksums` | | *Flag* | `False` | Enable IP/UDP checksum calculation |
 | `--log-level` | | *String* | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `--log-file` | | *String* | `None` | Optional file to write log messages to |
 | `--timeout` | | *Float* | `None` | UDP timeout in seconds (default: $0.5 \times \min(\text{Period}, 1.0)$) |
 | `--quabos` | | *List* | `None` | Overrides site defaults with specific `host[:port]` |
 
