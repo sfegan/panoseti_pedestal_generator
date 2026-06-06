@@ -919,6 +919,25 @@ class QuaboManager(asyncio.DatagramProtocol):
 
         return results
 
+class CommandProtocol(asyncio.DatagramProtocol):
+    """Listens for remote control commands via UDP."""
+    def __init__(self, stop_callback, logger):
+        self.stop_callback = stop_callback
+        self.logger = logger
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        msg = data.decode('utf-8', errors='ignore').strip()
+        if msg == "STOP":
+            self.logger.info(f"STOP command received from {addr}")
+            self.transport.sendto(b"STOPPING\n", addr)
+            self.stop_callback()
+        elif msg:
+            self.logger.debug(f"Received unknown command '{msg}' from {addr}")
+
 class QuaboClient:
     """Helper to track state for a single quabo board."""
     def __init__(self, ip, port, quadrant):
@@ -964,6 +983,8 @@ class PedestalGenerator:
         self.cycle_count = 0
         self.manager = None
         self.transport = None
+        self.cmd_transport = None
+        self.stop_event = asyncio.Event()
 
         self.writers = []
         if args.pcap:
@@ -1100,8 +1121,16 @@ class PedestalGenerator:
         # Initialize the single shared socket
         self.transport, self.manager = await loop.create_datagram_endpoint(
             lambda: QuaboManager(),
-            local_addr=('0.0.0.0', self.args.bind_port)
+            local_addr=('0.0.0.0', self.args.data_port)
         )
+
+        # Initialize command port if requested
+        if self.args.command_port > 0:
+            self.cmd_transport, _ = await loop.create_datagram_endpoint(
+                lambda: CommandProtocol(lambda: self.stop_event.set(), self.logger),
+                local_addr=('0.0.0.0', self.args.command_port)
+            )
+            self.logger.info(f"Command port listening on UDP port {self.args.command_port}")
         
         # Increase OS UDP receive buffer to handle high-frequency bursts
         sock = self.transport.get_extra_info('socket')
@@ -1117,7 +1146,7 @@ class PedestalGenerator:
         local_addr = self.transport.get_extra_info('sockname')
         frequency_string = f'1/{-self.args.frequency}' if self.args.frequency < -1 else f'{max(1,self.args.frequency)}'
         self.logger.info(f"Starting pedestal capture at {frequency_string} Hz")
-        self.logger.info(f"Bound to local UDP port {local_addr[1]}")
+        self.logger.info(f"Bound to local data UDP port {local_addr[1]}")
         
         # Start background tasks with proper handles for clean shutdown
         for writer in self.writers:
@@ -1150,7 +1179,7 @@ class PedestalGenerator:
             timeout = max(MIN_TIMEOUT, 0.5 * min(self.period, 1.0))
 
         try:
-            while True:
+            while not self.stop_event.is_set():
                 # Check if any writer task has encountered a critical failure
                 writer_failed = False
                 for writer in self.writers:
@@ -1174,8 +1203,18 @@ class PedestalGenerator:
                     trigger_wall += self.period
                     trigger_mono += self.period
                     sleep_dur += self.period
+                
                 if sleep_dur > 0:
-                    await asyncio.sleep(sleep_dur)
+                    try:
+                        await asyncio.wait_for(self.stop_event.wait(), timeout=sleep_dur)
+                        # If we get here, stop_event.wait() finished, meaning it was set
+                        break
+                    except asyncio.TimeoutError:
+                        # Normal sleep timeout, continue with triggering
+                        pass
+
+                if self.stop_event.is_set():
+                    break
 
                 # ---- Packets on the wire as fast as possible after wake ----
                 # send_all() is synchronous: all sendto() calls happen with no
@@ -1241,6 +1280,10 @@ class PedestalGenerator:
             # Clean shutdown: flush remaining data, drain the queue, then close.
             # ----------------------------------------------------------------
             self._print_watchdog_report(is_final=True)
+
+            if self.stop_event.is_set():
+                self.logger.info("Termination requested via command port. Waiting 5s before final cleanup.")
+                await asyncio.sleep(5.0)
             
             try:
                 try:
@@ -1279,6 +1322,8 @@ class PedestalGenerator:
 
                 if self.transport:
                     self.transport.close()
+                if self.cmd_transport:
+                    self.cmd_transport.close()
             finally:
                 pass
 
@@ -1301,7 +1346,8 @@ async def main():
     parser.add_argument('--pff-buffer', type=int, default=None, help='Number of events to buffer before writing (default: auto)')
 
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
-    parser.add_argument('--bind-port', type=int, default=0, help='Local UDP port to bind to (0 for random)')
+    parser.add_argument('--data-port', type=int, default=0, help='Local UDP port to bind to for data (0 for random)')
+    parser.add_argument('--command-port', type=int, default=0, help='UDP port to listen for control commands (0 to disable)')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/min(period, 1.0)))')
     parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')

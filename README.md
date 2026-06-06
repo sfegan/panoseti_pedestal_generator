@@ -98,14 +98,27 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 | `--site` | `-s` | *String* | **Required** | Preset choice (`gattini`, `winter`, `fern`, `pti`, `localhost`) |
 | `--frequency` | | *Int* | `1` | Frequency in Hz (-1000-1000). Use negative integers for $1/n$ Hz (e.g. `-2` = 0.5 Hz). |
 | `--rollover` | | *Int* | `600` | Rollover interval in seconds (0 to disable) |
-| `--output` | `-o` | *String* | `pedestals_{scope}_{date}_{time}.pcapng` | Output path template |
+| `--pcap-output` | `-o` | *String* | `pedestals_{scope}_{date}_{time}.pcapng` | Output path template for PCAP |
+| `--pff-output` | | *String* | `start_{isotime}.dp_ped1024.bpp_2.module_{module}.seqno_{seqid}.pff` | Output path template for PFF |
 | `--tai-offset` | | *Int* | `37` | TAI offset from UTC in seconds |
-| `--bind-port` | | *Int* | `0` | Local port to bind (0 for random) |
-| `--buffer` | | *Int* | *Dynamic* | Packets to buffer before write (Default: 60 or frequency) |
+| `--data-port` | | *Int* | `0` | Local port to bind for data (0 for random) |
+| `--command-port` | | *Int* | `0` | Port for control commands (0 to disable) |
+| `--pcap-buffer` | | *Int* | *Dynamic* | Packets to buffer before write (Default: 60 or frequency) |
 | `--compute-checksums` | | *Flag* | `False` | Enable IP/UDP checksum calculation |
 | `--log-level` | | *String* | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `--timeout` | | *Float* | `None` | UDP timeout in seconds (default: $0.5 \times \min(\text{Period}, 1.0)$) |
 | `--quabos` | | *List* | `None` | Overrides site defaults with specific `host[:port]` |
+
+---
+
+## Command Port
+
+If `--command-port` is set to a non-zero value, the script listens for UDP commands. 
+
+- **STOP**: Sending the string `STOP` to the command port will cause the script to signal a shutdown.
+- **Response**: The script responds with `STOPPING` to the sender.
+- **Termination**: Upon receiving `STOP`, the main run loop terminates immediately.
+- **Grace Period**: The script waits for 5 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response).
 
 ---
 
