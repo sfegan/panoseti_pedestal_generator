@@ -50,7 +50,7 @@ The raw response packets from the quabos contain a 4-byte header and 512 bytes o
 | `2` | 2B | `packet_no` | Lower 16-bits of pedestal PLL loop cycle counter |
 | `4` | 2B | `boardloc` | Location ID: `(Module ID << 2) \| Quadrant ID` calculated from Quabi IP address |
 | `6` | 4B | `TAI` | TAI seconds since epoch of *scheduled* pedestal event time from PLL loop (`UTC + tai_offset`) |
-| `10` | 4B | `NANOSEC` | Sub-second trigger time in nanoseconds |
+| `10` | 4B | `NANOSEC` | Sub-second time of *scheduled* pedestal event from PLL loop in nanoseconds |
 | `14` | 2B | *Reserved* (or `Flags`?) | 0x0001 |
 | `16` | 512B | `pixel_data` | 256 pixel values (16-bit unsigned values) |
 
@@ -95,6 +95,7 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 | `fern` | Fern | `192.168.3.240` | `192.168.0.9` | `252` | Sequential IPs |
 | `pti` | PTI | `192.168.3.232` | `192.168.0.8` | `250` | Sequential IPs |
 | `localhost` | Emulator | `127.0.0.1` | `127.0.0.1` | `0` | Sequential Ports |
+
 
 ---
 
