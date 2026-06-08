@@ -61,7 +61,7 @@ This packet is enapusleted in a *UDP header* (8 bytes), an *IPv4 header* (20 byt
 
 ### 2. PFF file writer
 
-PFF is a hybrid ascci/binary format described in the [PFF specification](https://github.com/panoseti/panoseti/wiki/Data-file-format). The measurements from the four Quabos are aligned and combined into a single image and written in binary format to the `.pff` file. This image is prefixed by a 491-byte JSON header and a single '*' to indicate the beginning of the binary data. The total **size of each event is 2,540 bytes**.
+PFF is a hybrid ascii/binary format described in the [PFF specification](https://github.com/panoseti/panoseti/wiki/Data-file-format). The measurements from the four Quabos are aligned and combined into a single image and written in binary format to the `.pff` file. This image is prefixed by a 491-byte JSON header and a single '*' to indicate the beginning of the binary data. The total **size of each event is 2,540 bytes**.
 
 The JSON format and binary delimiter are illustrated below:
 
