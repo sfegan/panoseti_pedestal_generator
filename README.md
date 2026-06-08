@@ -48,6 +48,8 @@ Raw response packets from the quabos contain a 4-byte header and 512 bytes of pi
 | `14` | 2B | *Reserved* (or `Flags`?) | 0x0001 |
 | `16` | 512B | `pixel_data` | 256 pixel values (16-bit signed integers; or are these unsigned.. to be determined?) |
 
+**Note:** The `module_id` is automatically calculated from bits 2:10 of the `base_ip` if not explicitly provided via `--module-id` or site configuration.
+
 **Note:** I propose that the *Reserved* field be considered as a *Flags* field in the future, allowing for future expansion without breaking compatibility. Here I propose that bit 0 (LSB) be used to indicate whether the payload contains a software triggered event.
 
 ### 4. Ethernet/IP/UDP Encapsulation
@@ -103,6 +105,8 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 | `--tai-offset` | | *Int* | `37` | TAI offset from UTC in seconds |
 | `--data-port` | | *Int* | `0` | Local port to bind for data (0 for random) |
 | `--command-port` | | *Int* | `0` | Port for control commands (0 to disable) |
+| `--quabo-base-ip` | | *String* | *Site default* | Base IP address for quabo boards |
+| `--module-id` | | *Int* | *Auto* | Module ID (calculated from IP if not set) |
 | `--pcap-buffer` | | *Int* | *Dynamic* | Packets to buffer before write (Default: 60 or frequency) |
 | `--compute-checksums` | | *Flag* | `False` | Enable IP/UDP checksum calculation |
 | `--log-level` | | *String* | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |

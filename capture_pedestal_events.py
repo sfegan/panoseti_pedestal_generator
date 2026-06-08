@@ -64,31 +64,26 @@ SITES = {
     'gattini': {
         'base_ip': '192.168.3.248',
         'daq_ip': '192.168.0.4',
-        'module_id': 254,
         'scope': 'Gattini'
     },
     'winter': {
         'base_ip': '192.168.3.244',
         'daq_ip': '192.168.0.6',
-        'module_id': 253,
         'scope': 'Winter'
     },
     'fern': {
         'base_ip': '192.168.3.240',
         'daq_ip': '192.168.0.9',
-        'module_id': 252,
         'scope': 'Fern'
     },
     'pti': {
         'base_ip': '192.168.3.232',
         'daq_ip': '192.168.0.8',
-        'module_id': 250,
         'scope': 'PTI'
     },
     'localhost': {
         'base_ip': '127.0.0.1',
         'daq_ip': '127.0.0.1',
-        'module_id': 0,
         'scope': 'Emulator',
         'use_ports': True
     },
@@ -983,10 +978,29 @@ class CommandProtocol(asyncio.DatagramProtocol):
 class PedestalGenerator:
     def __init__(self, args):
         self.args = args
-        self.site_info = SITES[args.site]
+        self.site_info = SITES[args.site].copy()
         self.scope = self.site_info['scope']
         self.logger = logging.LoggerAdapter(logger, {'scope': self.scope})
         
+        # Override base_ip if provided
+        if self.args.quabo_base_ip:
+            self.logger.info(f"Overriding quabo base_ip to {self.args.quabo_base_ip}")
+            self.site_info['base_ip'] = self.args.quabo_base_ip
+            
+        # Determine module_id: command-line > site-config > automatic from base_ip
+        if self.args.module_id is not None:
+            self.logger.info(f"Overriding module_id to {self.args.module_id}")
+            self.site_info['module_id'] = self.args.module_id
+        elif 'module_id' not in self.site_info:
+            try:
+                ip_bytes = socket.inet_aton(self.site_info['base_ip'])
+                ip_int = struct.unpack('!I', ip_bytes)[0]
+                self.site_info['module_id'] = (ip_int >> 2) & 0x1FF
+                self.logger.info(f"Automatically determined module_id {self.site_info['module_id']} from base_ip {self.site_info['base_ip']}")
+            except Exception as e:
+                self.logger.error(f"Could not calculate module_id from base_ip: {e}")
+                self.site_info['module_id'] = 0
+
         self.quabos = self._init_quabos()
         self._validate_quabos()
         
@@ -1362,6 +1376,8 @@ async def main():
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--data-port', type=int, default=0, help='Local UDP port to bind to for data (0 for random)')
     parser.add_argument('--command-port', type=int, default=0, help='UDP port to listen for control commands (0 to disable)')
+    parser.add_argument('--quabo-base-ip', help='Base IP address for quabo boards. Overrides site default.')
+    parser.add_argument('--module-id', type=int, help='Module ID. Overrides site default and automatic calculation.')
     parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--log-file', help='Write log messages to this file')
     parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/min(period, 1.0)))')
