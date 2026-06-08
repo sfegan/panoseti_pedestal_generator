@@ -51,9 +51,9 @@ MAX_FREQUENCY = 1000   # Hard upper limit (Hz)
 MIN_TIMEOUT   = 0.002  # Hard lower limit on auto-computed timeout (seconds)
 
 # Payload size constants for science packet extraction from raw QUABO response
-_PKT_HEADER_OFFSET = 4
+_PKT_HEADER_OFFSET  = 4
 _PKT_PAYLOAD_LEN    = 512
-_PKT_PAYLOAD_END   = _PKT_HEADER_OFFSET + _PKT_PAYLOAD_LEN # 516
+_PKT_PAYLOAD_END    = _PKT_HEADER_OFFSET + _PKT_PAYLOAD_LEN # 516
 
 # Pre-built trigger command — 64 bytes, first byte 0x0c, rest zero.
 # Built once at import time so struct.pack() is never called in the hot path.
