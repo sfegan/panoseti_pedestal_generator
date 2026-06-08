@@ -1,7 +1,7 @@
 # PANOSETI Pedestal Generator
 
 This repository contains a tool to trigger and capture pedestal events from PANOSETI detector modules:
-- `capture_pedestal_events.py`: Polls detector boards (Quabos) for software-generated Pulse Height pedestals events, wraps the payloads in Ethernet/IP/UDP headers, and writes them to a `.pcapng` file.
+- `capture_pedestal_events.py`: Polls detector boards (Quabos) for software-generated Pulse Height pedestals events, wraps the payloads in Ethernet/IP/UDP headers, and optionally writes them to disk.
 - `quabo_emulator.py`: Emulates four Quabo boards responding to SW PH trigger commands with normal-distributed random pixel values for testing.
 
 Author: Stephen Fegan <sfegan@llr.in2p3.fr> (2026-05-30)
@@ -13,65 +13,70 @@ AI usage: Gemini-CLI
 
 ## Pedestal Events
 
-Pedestal events sample the baseline pixel amplitudes when no trigger is present. These can be used downstream to estimate the average baseline per pixel and its variance. These are used in a gamma-ray analysis to subtract the baseline during pulse analysis and to fit the pointing model based on the contribution of starlist to the pixel variance. Externally generated pedestal events improve the measurement of these values by increasing the sampling to any desired rate, independent of the actual trigger rate of the system.
+Pedestal events sample the baseline pixel amplitudes when no trigger is present. These can be used to estimate the average baseline per pixel and its variance. These are used in a gamma-ray analysis to subtract the baseline during pulse analysis and to fit the pointing model based on the contribution of starlight to the pixel variance. Externally generated pedestal events improve the measurement of these values by increasing the sampling to any desired rate, independent of the actual trigger rate of the system.
+
+This utility is designed to poll the Quabo boards with software-generated triggers at a user-defined frequency to capture pedestal events. It can be run during normal observations at low frequencies (e.g. 1 Hz) to continuously monitor the pedestal values during a run. 
+
+**Note:** In PANOSETI, in the nominal acquisition mode, the Quabo boards automatically subtract an estimate of the baseline from the measured values for on-sky triggers and return the resulting value as a signed integer. The baselines are astimated from a series of baseline measurements taken at the beginning of data-taking every night. They **do not** perform this subtraction for softare-triggered events; they return the raw measured values. The measured values in the pedestal events are therefore offset from those in the on-sky events. The DAQ writes the measured baseline offsets into the `quabo_ph_baseline.json` files in the `pff` directories; these can be used to correct this difference.
 
 ---
 
-## How It Works
+## Theory of Operation
 
-`capture_pedestal_events.py` polls a module of four Quabo boards (each processing 256 pixels), records the responses, and writes them to a `.pcapng` file for offline analysis. The script is designed to run at low frequencies during an observation, or at high frequencies (up to 1000 Hz) for dedicated calibration runs.
+`capture_pedestal_events.py` sends regular [software-trigger commands](https://github.com/panoseti/panoseti/wiki/Quabo-packet-interface) to the four Quabo boards (each processing 256 pixels) at a fixed rate, listens for their responses, and optionally writes the data to a `.pcapng` and/or `.pff`file. The code has no external dependencies beyond the standard Python library, notably `asyncio`, and does not need any special privelages to run.
 
-### 1. Timing and Scheduling
+1. The script opens a UDP port, either with a fixed port assigned on the command line, or a randomly assigned one.
+2. It starts a phase-locked polling loop with a fixed frequency of either *N Hz* or *1/N Hz* (with *N&le;1000*).
+3. On each iteration a software trigger command is sent to all four Quabos concurrently.
+4. The code waits a short time for the responses from the Quabos. If no writers are configured the responses are discarded.
+5. **Optionally:** if writing in `.pcapng` format is configured: the response packet is transformed into a standard PANOSETI science packet and written to disk as a `.pcapng` file with a time-based rollover. See below for more details.
+6. **Optionally:** if writing in `.pff` format is configured: the respone packets from the four Quabos are combined and written to a `.pff` file, with a size-based rollover. See below for more details.
+7. A watchdog timer reports the number of pedestal events generated and the number of packets received lost.
+8. The polling loop can be terminated by a ctrl-C or TERM signal.
+9. **Optionally:** the script can listen for commands on a pre-defined UDP port (separate from the data port). It accepts a single command `STOP` in a UDP packet which terminates the polling loop. If configured, the script responds to this command with a UDP packet containing the bytes `STOPPING`.
 
-The script uses a software-based phase-locked loop to schedule polling times relative to the system clock. It supports both high frequencies and fractional frequencies (periods > 1s). Triggers are scheduled at:
-$$\text{Trigger Time} = \text{Epoch} + (\text{Slot} \times \text{Period}) + \text{Offset}$$
-where:
-*   $\text{Period}$ is derived from `--frequency` (supports negative integers for $1/n$ Hz).
-*   $\text{Offset} = 0.5 \times \min(\text{Period}, 1.0)$.
+### 1. PCAPNG file writer
 
-This ensures that for high frequencies, triggers occur in the middle of each time slot, while for fractional frequencies (periods $\ge 1$s), triggers are anchored at exactly $0.5$ seconds into the first second of the polling cycle.
+PCAPNG is a [binary file format](https://pcapng.com/) desiged for writing network packets, and is used by by the packet-capture sofware *Wireshark*. A minimal implementation of a `.pcapng` file starts with two file-level headers, the `Section Header Block (SHB)` and the `Interface Description Block (IDB)`, followed by any number of paxket. Each packet must be prefixed by an `Enhanced Packet Block (EPB)` which contains the packet length and timestamp. The full packet is then written after the `EPB`.
 
-### 2. UDP Polling
-In each cycle, the script sends the 64-byte software read command (`R_PH`: first byte `0x0c` followed by zeros) to the four configured quabo boards concurrently. It waits for responses from the quabos which contain the measured PH data. These are matched to pending requests using the quabo's `(IP, Port)` address and matched packets are given the same sequence number and event time for tracking. If a response is not received within the specified timeout, the quabo is marked as "dropped" for that cycle, which is logged in the diagnostics.
+To emulate the format of the normal onsky-trigger events that are written by the PANOSETI DAQ, the pedestal capture code can transform the responsees received from the Quabos into the science data-packet format, as describe below, encapsulate them in *fake* UDP/IP/Ethernet/EPB headers and write them to disk as a synthetic `.pcapng` file. **Note:** this does not involve running any packet capture code such as Wireshark, the Python code simply writes the headers ad data to the files itself. The code provides rollover of the `.pcapng` file at any desired time period (default 600 seconds).
 
-### 3. Packet Format & Repacking
-Raw response packets from the quabos contain a 4-byte header and 512 bytes of pixel data (256 channels of 16-bit signed integers). The script repacks this data into a 528-byte PANOSETI Science Packet:
+The raw response packets from the quabos contain a 4-byte header and 512 bytes of pixel data (256 channels of 16-bit signed integers). The script repacks this data into a 528-byte PANOSETI Science Packet:
 
 | Offset (Bytes) | Size | Field Name | Value / Description |
 | :--- | :--- | :--- | :--- |
 | `0` | 1B | `acq_mode` | `0x01` (Pulse Height) |
 | `1` | 1B | `packet_ver` | `1` (16-bit signed PH) |
-| `2` | 2B | `packet_no` | 16-bit sequence number (Little-Endian) |
-| `4` | 2B | `boardloc` | Location ID: `(Module ID << 2) \| Quadrant` |
-| `6` | 4B | `TAI` | TAI seconds since epoch (`UTC + tai_offset`) |
+| `2` | 2B | `packet_no` | Lower 16-bits of pedestal PLL loop cycle counter |
+| `4` | 2B | `boardloc` | Location ID: `(Module ID << 2) \| Quadrant ID` calculated from Quabi IP address |
+| `6` | 4B | `TAI` | TAI seconds since epoch of *scheduled* pedestal event time from PLL loop (`UTC + tai_offset`) |
 | `10` | 4B | `NANOSEC` | Sub-second trigger time in nanoseconds |
 | `14` | 2B | *Reserved* (or `Flags`?) | 0x0001 |
-| `16` | 512B | `pixel_data` | 256 pixel values (16-bit signed integers; or are these unsigned.. to be determined?) |
-
-**Note:** The `module_id` is automatically calculated from bits 2:10 of the `base_ip` if not explicitly provided via `--module-id` or site configuration.
+| `16` | 512B | `pixel_data` | 256 pixel values (16-bit unsigned values) |
 
 **Note:** I propose that the *Reserved* field be considered as a *Flags* field in the future, allowing for future expansion without breaking compatibility. Here I propose that bit 0 (LSB) be used to indicate whether the payload contains a software triggered event.
 
-### 4. Ethernet/IP/UDP Encapsulation
-The 528-byte science payload is wrapped in mock network headers to match packets that have been captured with Wireshark (Total size: 570 bytes).
-* **Ethernet II Header** (14 bytes): Source/Dest MAC set to zero. EtherType `0x0800`.
-* **IPv4 Header** (20 bytes): Quabo IP as source, DAQ IP as destination.
-* **UDP Header** (8 bytes): Port `60001` for source and destination.
-* **Checksums**: By default, IP and UDP checksums are set to zero. Full checksum calculation can be enabled via `--compute-checksums`.
+This packet is enapusleted in a *UDP header* (8 bytes), an *IPv4 header* (20 bytes), an *EThernet II header* (14 bytes) and the *EPB header* (28 bytes) and *EPB footer$ (4 bytes) required by the PCAPNG format, for a total packet size of 570 bytes. Including the required padding to 4-byte boundaries, the total size of each packet in the `.pcapng` file is 604 bytes, or **2,416 bytes per event** (4 Quabos).
 
-### 5. PCAPNG file output (`PcapngWriter`)
-To emulate the handling of the science packets from normal, triggered events, the pedestal packets are written to a `.pcapng` file using the internal `PcapngWriter` class, which handles writing the various PCAPNG header blocks. The output file is named according to the template specified by `--output` (default: `pedestals_{scope}_{date}_{time}.pcapng`), where:
-* `{scope}` is the site name (e.g. `Gattini`, `Winter`, `Fern` or `PTI`).
-* `{date}` is the current date in `YYYYMMDD` format.
-* `{time}` is the current time in `HHMMSS` format.
-* **Rollover**: Files roll over after `--rollover` seconds. Setting `--rollover 0` disables rotation, using a single file for the entire session.
 
-### 6. Diagnostics and Monitoring
-* **Watchdog**: Logs a summary every 60 seconds including:
-    * Number of pedestal events generated.
-    * **Dropped Cycles**: Indicates if the script is falling behind (CPU/OS bottleneck).
-    * **Missing Packets**: Tracks packet loss per Quabo (Network bottleneck).
-* **Logging**: the logging level of the Python logger can be adjusted via the `--log-level` argument.
+### 2. PFF file writer
+
+PFF is a hybrid ascci/binary format described in the [PFF specification](https://github.com/panoseti/panoseti/wiki/Data-file-format). The measurements from the four Quabos are aligned and combined into a single image and written in binary format to the `.pff` file. This image is prefixed by a 491-byte JSON header and a single '*' to indicate the beginning of the binary data. The total **size of each event is 2,540 bytes**.
+
+The JSON format and binary delimiter are illustrated below:
+
+```json
+{
+   "quabo_0": { "pkt_num":          3, "pkt_tai":  762, "pkt_nsec": 500000000, "tv_sec": 1780926165, "tv_usec": 500000}, 
+   "quabo_1": { "pkt_num":          3, "pkt_tai":  762, "pkt_nsec": 500000000, "tv_sec": 1780926165, "tv_usec": 500000}, 
+   "quabo_2": { "pkt_num":          3, "pkt_tai":  762, "pkt_nsec": 500000000, "tv_sec": 1780926165, "tv_usec": 500000}, 
+   "quabo_3": { "pkt_num":          3, "pkt_tai":  762, "pkt_nsec": 500000000, "tv_sec": 1780926165, "tv_usec": 500000}
+}
+
+*
+```
+
+Any missing packets will result in the values stored in the binary and JSON blocks being identically zero. Checking for `tv_sec==0` is a reliable way to identify such packets since this cannot occur in any other way.
 
 ---
 
