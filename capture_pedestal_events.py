@@ -652,11 +652,8 @@ class PffWriter(DataWriter):
 
         # Event boundary detection
         if self.pending_cycle is not None and cycle_count != self.pending_cycle:
-            # Previous cycle was incomplete: count how many quabos arrived for it
-            arrived_count = bin(self.arrived_quabos).count('1')
-            missing = [idx for idx in range(4) if not (self.arrived_quabos & (1 << idx))]
-            self.logger.debug(f"[PFF] Incomplete event for cycle {self.pending_cycle} (missing quabos {missing}), discarding.")
-            self.disk_misses_since_last_report += arrived_count
+            # Previous cycle was incomplete: finalize it rather than discarding
+            self._assemble_and_commit()
             self.pending_cycle = None
             self.arrived_quabos = 0
 
@@ -669,6 +666,10 @@ class PffWriter(DataWriter):
             self.pending_ts_utc = ts_utc
             if self.buffer_count == 0:
                 self.buffer_first_ts_utc = ts_utc
+            
+            # Zero out the image data region for this event to handle missing quabos
+            img_offset = self.buffer_ptr + self._JSON_TOTAL_LEN + 1
+            self.buffer[img_offset : img_offset + self._IMAGE_DATA_LEN] = b'\x00' * self._IMAGE_DATA_LEN
 
         # Write this quabo's data directly to the active insertion point in the buffer
         offset = self.buffer_ptr + self._JSON_TOTAL_LEN + 1
@@ -698,10 +699,13 @@ class PffWriter(DataWriter):
             self.arrived_quabos = 0
 
     def _assemble_and_commit(self):
+        if self.arrived_quabos == 0:
+            return
+
         ptr = self.buffer_ptr
         
         # 1. Build and write the 491-byte JSON block
-        json_bytes = self._build_json_block(self.pending_ts_tai, self.pending_nanosec, self.pending_ts_utc, self.pending_cycle)
+        json_bytes = self._build_json_block(self.pending_ts_tai, self.pending_nanosec, self.pending_ts_utc, self.pending_cycle, self.arrived_quabos)
         self.buffer[ptr : ptr + self._JSON_TOTAL_LEN] = json_bytes
         ptr += self._JSON_TOTAL_LEN
 
@@ -715,30 +719,36 @@ class PffWriter(DataWriter):
         if self.buffer_count >= self.buffer_events:
             self._flush_buffer_to_queue()
 
-    def _build_json_block(self, ts_tai, nanosec, ts_utc, cycle_count) -> bytes:
+    def _build_json_block(self, ts_tai, nanosec, ts_utc, cycle_count, arrived_mask) -> bytes:
         pkt_num  = cycle_count % 1000000
         pkt_tai  = ts_tai % 10000
         pkt_nsec = nanosec % 1000_000_000
         tv_sec   = int(ts_utc) % 1000_000_0000
         tv_usec  = int((ts_utc % 1.0) * 1_000_000) % 1000000
 
-        def quabo_line(name, comma):
+        def quabo_line(name, comma, arrived):
+            pn = pkt_num if arrived else 0
+            pt = pkt_tai if arrived else 0
+            ps = pkt_nsec if arrived else 0
+            ts = tv_sec if arrived else 0
+            tu = tv_usec if arrived else 0
+            
             tail = ', ' if comma else ''
             return (
                 f'   "{name}": {{'
-                f' "pkt_num": {pkt_num:10d},'
-                f' "pkt_tai": {pkt_tai:4d},'
-                f' "pkt_nsec": {pkt_nsec:9d},'
-                f' "tv_sec": {tv_sec:10d},'
-                f' "tv_usec": {tv_usec:6d}}}{tail}\n'
+                f' "pkt_num": {pn:10d},'
+                f' "pkt_tai": {pt:4d},'
+                f' "pkt_nsec": {ps:9d},'
+                f' "tv_sec": {ts:10d},'
+                f' "tv_usec": {tu:6d}}}{tail}\n'
             )
 
         body_lines = (
             '{\n' +
-                quabo_line('quabo_0', comma=True) +
-                quabo_line('quabo_1', comma=True) +
-                quabo_line('quabo_2', comma=True) +
-                quabo_line('quabo_3', comma=False)
+                quabo_line('quabo_0', comma=True, arrived=bool(arrived_mask & 0x1)) +
+                quabo_line('quabo_1', comma=True, arrived=bool(arrived_mask & 0x2)) +
+                quabo_line('quabo_2', comma=True, arrived=bool(arrived_mask & 0x4)) +
+                quabo_line('quabo_3', comma=False, arrived=bool(arrived_mask & 0x8))
         )
                 
         body = body_lines + '}'
@@ -772,6 +782,10 @@ class PffWriter(DataWriter):
         return count
 
     def close(self) -> None:
+        if hasattr(self, 'pending_cycle') and self.pending_cycle is not None:
+            self._assemble_and_commit()
+            self.pending_cycle = None
+
         try:
             loop = asyncio.get_running_loop()
             loop_is_running = loop.is_running()
