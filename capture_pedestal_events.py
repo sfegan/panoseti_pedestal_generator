@@ -970,9 +970,10 @@ class CommandProtocol(asyncio.DatagramProtocol):
         msg = data.decode('utf-8', errors='ignore').strip()
         if msg == "STOP":
             self.logger.info(f"STOP command received from {addr}")
-            self.transport.sendto(b"STOPPING\n", addr)
+            self.transport.sendto(b"STOPPING", addr)
             self.stop_callback()
         elif msg:
+            self.transport.sendto(b"UNKNOWN COMMAND", addr)
             self.logger.debug(f"Received unknown command '{msg}' from {addr}")
 
 class PedestalGenerator:
@@ -1310,8 +1311,8 @@ class PedestalGenerator:
             self._print_watchdog_report(is_final=True)
 
             if self.stop_event.is_set():
-                self.logger.info("Termination requested via command port. Waiting 5s before final cleanup.")
-                await asyncio.sleep(5.0)
+                self.logger.info("Termination requested via command port. Waiting 2s before final cleanup.")
+                await asyncio.sleep(2.0)
             
             try:
                 try:
