@@ -1370,9 +1370,20 @@ class PedestalGenerator:
 
 async def main():
     parser = argparse.ArgumentParser(description='PANOSETI Pedestal Capture')
-    parser.add_argument('--site', '-s', required=True, choices=SITES.keys(), help='Telescope site')
+
+    # General options
     parser.add_argument('--frequency', '-f', type=int, default=1, help=f'Polling frequency in Hz (1–{MAX_FREQUENCY}, or negative for 1/n Hz)')
-    
+    parser.add_argument('--data-port', '-p', type=int, default=0, help='Local UDP port to bind to for data (0 for random)')
+    parser.add_argument('--command-port', '-c', type=int, default=0, help='UDP port to listen for control commands (0 to disable)')
+    parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/min(period, 1.0)))')
+    parser.add_argument('--watchdog-period', type=int, default=60, help='Watchdog summary logging period in seconds')
+
+    # Site and quabo options
+    parser.add_argument('--site', '-s', required=True, choices=SITES.keys(), help='Telescope site')
+    parser.add_argument('--quabo-base-ip', help='Base IP address for quabo boards. Overrides site default.')
+    parser.add_argument('--module-id', type=int, help='Module ID. Overrides site default and automatic calculation.')
+    parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
+
     # PCAP options
     parser.add_argument('--pcap', action='store_true', help='Enable PCAP output (pcapng format)')
     parser.add_argument('--pcap-output', '-o', default='pedestals_{scope}_{date}_{time}.pcapng', help='Filename template for PCAP files')
@@ -1386,18 +1397,14 @@ async def main():
     parser.add_argument('--pff-max-size', type=int, default=1024, help='PFF file size rollover threshold in MB')
     parser.add_argument('--pff-buffer', type=int, default=None, help='Number of events to buffer before writing (default: auto)')
 
-    parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
-    parser.add_argument('--data-port', type=int, default=0, help='Local UDP port to bind to for data (0 for random)')
-    parser.add_argument('--command-port', type=int, default=0, help='UDP port to listen for control commands (0 to disable)')
-    parser.add_argument('--quabo-base-ip', help='Base IP address for quabo boards. Overrides site default.')
-    parser.add_argument('--module-id', type=int, help='Module ID. Overrides site default and automatic calculation.')
-    parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
-    parser.add_argument('--log-file', help='Write log messages to this file')
-    parser.add_argument('--timeout', type=float, default=None, help=f'UDP response timeout in seconds (default: max({MIN_TIMEOUT}, 0.5/min(period, 1.0)))')
-    parser.add_argument('--quabos', nargs='+', help='List of quabo addresses in host[:port] format. Overrides site defaults.')
-    parser.add_argument('--watchdog-period', type=int, default=60, help='Watchdog summary logging period in seconds')
+    # Logging options
+    parser.add_argument('--log-level', '-l', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
+    parser.add_argument('--log-file', '-f', help='Write log messages to this file')
 
+    # Esoteric options
+    parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--test-card', action='store_true', help='Replace all quabo data with a fixed test pattern (for testing PCAP/PFF output alignment)')
+
     args = parser.parse_args()
 
     # ---- Argument validation ----
