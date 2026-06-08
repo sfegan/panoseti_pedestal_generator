@@ -1398,8 +1398,8 @@ async def main():
     parser.add_argument('--pff-buffer', type=int, default=None, help='Number of events to buffer before writing (default: auto)')
 
     # Logging options
-    parser.add_argument('--log-level', '-l', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
-    parser.add_argument('--log-file', '-f', help='Write log messages to this file')
+    parser.add_argument('--log-level', default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
+    parser.add_argument('--log-file', help='Write log messages to this file')
 
     # Esoteric options
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
