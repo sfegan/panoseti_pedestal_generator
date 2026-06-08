@@ -1355,6 +1355,19 @@ class PedestalGenerator:
             finally:
                 pass
 
+###################################################################################################
+#
+#    888b     d888          d8b          
+#    8888b   d8888          Y8P          
+#    88888b.d88888                       
+#    888Y88888P888  8888b.  888 88888b.  
+#    888 Y888P 888     "88b 888 888 "88b 
+#    888  Y8P  888 .d888888 888 888  888 
+#    888   "   888 888  888 888 888  888 
+#    888       888 "Y888888 888 888  888 
+#
+###################################################################################################
+
 async def main():
     parser = argparse.ArgumentParser(description='PANOSETI Pedestal Capture')
     parser.add_argument('--site', '-s', required=True, choices=SITES.keys(), help='Telescope site')
