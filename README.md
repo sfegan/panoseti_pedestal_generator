@@ -126,10 +126,10 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 
 If `--command-port` is set to a non-zero value, the script listens for UDP commands. 
 
-- **STOP**: Sending the string `STOP` to the command port will cause the script to signal a shutdown.
+- **STOP**: Sending the string `STOP` to the command port (no newline) will cause the script to signal a shutdown.
 - **Response**: The script responds with `STOPPING` to the sender.
-- **Termination**: Upon receiving `STOP`, the main run loop terminates immediately.
-- **Grace Period**: The script waits for 2 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response).
+- **Termination**: Upon receiving `STOP`, the main run polling loop terminates immediately.
+- **Grace Period**: The script waits for 2 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response due to UDP packet loss).
 
 ---
 
