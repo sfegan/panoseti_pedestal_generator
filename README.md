@@ -129,7 +129,7 @@ If `--command-port` is set to a non-zero value, the script listens for UDP comma
 - **STOP**: Sending the string `STOP` to the command port will cause the script to signal a shutdown.
 - **Response**: The script responds with `STOPPING` to the sender.
 - **Termination**: Upon receiving `STOP`, the main run loop terminates immediately.
-- **Grace Period**: The script waits for 5 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response).
+- **Grace Period**: The script waits for 2 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response).
 
 ---
 
