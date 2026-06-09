@@ -23,14 +23,14 @@ This utility is designed to poll the Quabo boards with software-generated trigge
 
 ## Theory of Operation
 
-`capture_pedestal_events.py` sends periodic [software-trigger commands](https://github.com/panoseti/panoseti/wiki/Quabo-packet-interface) to the four Quabo boards (each processing 256 pixels) at a fixed rate, listens for their responses, and optionally writes the data to a `.pcapng` and/or `.pff` file. The code has no external dependencies beyond the standard Python library and does not need any special privileges to run. It is based on `asyncio`.
+`capture_pedestal_events.py` sends periodic [software-trigger commands](https://github.com/panoseti/panoseti/wiki/Quabo-packet-interface) to four Quabo boards at a configurable rate, listens for their responses, and optionally writes the data to a `.pcapng` and/or `.pff` file. The code has no external dependencies beyond the standard Python library and does not need any special privileges to run. It is based on `asyncio`.
 
 1. The script opens a UDP port, either with a fixed port assigned on the command line, or a randomly assigned one.
 2. It starts a phase-locked polling loop with a fixed frequency of either *N Hz* or *1/N Hz* (with *N&le;1000*).
 3. On each iteration a software trigger command is sent to all four Quabos concurrently.
 4. The code waits a short time for the responses from the Quabos. If no writers are configured the responses are discarded. 
-   * In this case the pedestal data are captured by the normal pactet capture system runnung on the DAQ (this should be verified), from where they can be retrieved by the offline analysis chains. To aid in identifying these packets, it may be helpful to run the pedestal generater at a fixed UDP port with the `--data-port` option, rather than having a random port assigned each run.
-   * It is not yet clear how these packets are handled by `hashpipe` or whether they are integrated into the usual `.pff` output files.
+   * In this case the pedestal must be captured by the normal PANOSETI pactet capture system (this should be verified), from where they can be retrieved by the offline analysis chains. To aid in identifying these packets, the pedestal generater can be run at a fixed UDP port with the `--data-port` option, rather than having a random port assigned each run.
+   * It is not yet clear how these packets are handled by `hashpipe` or whether they can be integrated into the usual `.pff` output files.
 5. **Optionally:** if writing in `.pcapng` format is configured: the response packet is transformed into a standard PANOSETI science packet and written to disk as a `.pcapng` file with a time-based rollover. See below for more details.
 6. **Optionally:** if writing in `.pff` format is configured: the response packets from the four Quabos are combined and written to a `.pff` file, with a size-based rollover. See below for more details.
 7. A watchdog timer reports the number of pedestal events generated and the number of packets received lost every minute.
