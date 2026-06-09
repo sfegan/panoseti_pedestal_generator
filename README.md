@@ -17,29 +17,31 @@ Pedestal events sample the baseline pixel amplitudes when no trigger is present.
 
 This utility is designed to poll the Quabo boards with software-generated triggers at a user-defined frequency to capture pedestal events. It can be run during normal observations at low frequencies (e.g. 1 Hz) to continuously monitor the pedestal values during a run. 
 
-**Note:** In PANOSETI, in the nominal acquisition mode, the Quabo boards automatically subtract an estimate of the baseline from the measured values for on-sky triggers and return the resulting value as a signed integer. The baselines are astimated from a series of baseline measurements taken at the beginning of data-taking every night. They **do not** perform this subtraction for softare-triggered events; they return the raw measured values. The measured values in the pedestal events are therefore offset from those in the on-sky events. The DAQ writes the measured baseline offsets into the `quabo_ph_baseline.json` files in the `pff` directories; these can be used to correct this difference.
+**Note:** In PANOSETI, in the nominal acquisition mode, the Quabo boards automatically subtract an estimate of the baseline from the measured values for on-sky triggers and return the resulting value as a signed integer. The baselines are estimated from a series of baseline measurements taken at the beginning of data-taking every night. They **do not** perform this subtraction for software-triggered events; they return the raw measured values. The measured values in the pedestal events are therefore offset from those in the on-sky events. The DAQ writes the measured baseline offsets into the `quabo_ph_baseline.json` files in the `pff` directories; these can be used to correct this difference.
 
 ---
 
 ## Theory of Operation
 
-`capture_pedestal_events.py` sends regular [software-trigger commands](https://github.com/panoseti/panoseti/wiki/Quabo-packet-interface) to the four Quabo boards (each processing 256 pixels) at a fixed rate, listens for their responses, and optionally writes the data to a `.pcapng` and/or `.pff`file. The code has no external dependencies beyond the standard Python library, notably `asyncio`, and does not need any special privelages to run.
+`capture_pedestal_events.py` sends periodic [software-trigger commands](https://github.com/panoseti/panoseti/wiki/Quabo-packet-interface) to the four Quabo boards (each processing 256 pixels) at a fixed rate, listens for their responses, and optionally writes the data to a `.pcapng` and/or `.pff` file. The code has no external dependencies beyond the standard Python library and does not need any special privileges to run. It is based on `asyncio`.
 
 1. The script opens a UDP port, either with a fixed port assigned on the command line, or a randomly assigned one.
 2. It starts a phase-locked polling loop with a fixed frequency of either *N Hz* or *1/N Hz* (with *N&le;1000*).
 3. On each iteration a software trigger command is sent to all four Quabos concurrently.
-4. The code waits a short time for the responses from the Quabos. If no writers are configured the responses are discarded.
+4. The code waits a short time for the responses from the Quabos. If no writers are configured the responses are discarded. 
+   * In this case the pedestal data are captured by the normal pactet capture system runnung on the DAQ (this should be verified), from where they can be retrieved by the offline analysis chains. To aid in identifying these packets, it may be helpful to run the pedestal generater at a fixed UDP port with the `--data-port` option, rather than having a random port assigned each run.
+   * It is not yet clear how these packets are handled by `hashpipe` or whether they are integrated into the usual `.pff` output files.
 5. **Optionally:** if writing in `.pcapng` format is configured: the response packet is transformed into a standard PANOSETI science packet and written to disk as a `.pcapng` file with a time-based rollover. See below for more details.
-6. **Optionally:** if writing in `.pff` format is configured: the respone packets from the four Quabos are combined and written to a `.pff` file, with a size-based rollover. See below for more details.
-7. A watchdog timer reports the number of pedestal events generated and the number of packets received lost.
+6. **Optionally:** if writing in `.pff` format is configured: the response packets from the four Quabos are combined and written to a `.pff` file, with a size-based rollover. See below for more details.
+7. A watchdog timer reports the number of pedestal events generated and the number of packets received lost every minute.
 8. The polling loop can be terminated by a ctrl-C or TERM signal.
-9. **Optionally:** the script can listen for commands on a pre-defined UDP port (separate from the data port). It accepts a single command `STOP` in a UDP packet which terminates the polling loop. If configured, the script responds to this command with a UDP packet containing the bytes `STOPPING`.
+9. **Optionally:** the script can listen for commands on a pre-defined UDP port (separate from the data port). It accepts a single command `STOP` in a UDP packet which terminates the polling loop. If configured, the script responds to this command with a UDP packet containing the bytes `STOPPING`. See below for more details.
 
 ### Option 1. Enable PCAPNG file writer
 
-PCAPNG is a [binary file format](https://pcapng.com/) desiged for writing network packets, and is used by by the packet-capture sofware *Wireshark*. A minimal implementation of a `.pcapng` file starts with two file-level headers, the `Section Header Block (SHB)` and the `Interface Description Block (IDB)`, followed by any number of paxket. Each packet must be prefixed by an `Enhanced Packet Block (EPB)` which contains the packet length and timestamp. The full packet is then written after the `EPB`.
+PCAPNG is a [binary file format](https://pcapng.com/) designed for writing network packets, and is used by the packet-capture software *Wireshark*. A minimal implementation of a `.pcapng` file starts with two file-level headers, the `Section Header Block (SHB)` and the `Interface Description Block (IDB)`, followed by any number of packets. Each packet must be prefixed by an `Enhanced Packet Block (EPB)` which contains the packet length and timestamp. The full packet is then written after the `EPB`.
 
-To emulate the format of the normal onsky-trigger events that are written by the PANOSETI DAQ, the pedestal capture code can transform the responsees received from the Quabos into the science data-packet format, as describe below, encapsulate them in *fake* UDP/IP/Ethernet/EPB headers and write them to disk as a synthetic `.pcapng` file. **Note:** this does not involve running any packet capture code such as Wireshark, the Python code simply writes the headers ad data to the files itself. The code provides rollover of the `.pcapng` file at any desired time period (default 600 seconds).
+To emulate the format of the normal on-sky-trigger events that are written by the PANOSETI DAQ, the pedestal capture code can transform the responsees received from the Quabos into the science data-packet format, as describe below, encapsulate them in *fake* UDP/IP/Ethernet/EPB headers and write them to disk as a synthetic `.pcapng` file. **Note:** this does not involve running any packet capture code such as Wireshark, the Python code simply writes the headers and data to the files itself. The code provides rollover of the `.pcapng` file at any desired time period (default 600 seconds).
 
 The raw response packets from the quabos contain a 4-byte header and 512 bytes of pixel data (256 channels of 16-bit signed integers). The script repacks this data into a 528-byte PANOSETI Science Packet:
 
@@ -56,12 +58,12 @@ The raw response packets from the quabos contain a 4-byte header and 512 bytes o
 
 **Note:** I propose that the *Reserved* field be considered as a *Flags* field in the future, allowing for future expansion without breaking compatibility. Here I propose that bit 0 (LSB) be used to indicate whether the payload contains a software triggered event.
 
-This packet is enapusleted in a *UDP header* (8 bytes), an *IPv4 header* (20 bytes), an *EThernet II header* (14 bytes) and the *EPB header* (28 bytes) and *EPB footer$ (4 bytes) required by the PCAPNG format, for a total packet size of 570 bytes. Including the required padding to 4-byte boundaries, the total size of each packet in the `.pcapng` file is 604 bytes, or **2,416 bytes per event** (4 Quabos).
+This packet is encapsulated in a *UDP header* (8 bytes), an *IPv4 header* (20 bytes), an *Ethernet II header* (14 bytes) and the *EPB header* (28 bytes) and *EPB footer* (4 bytes) required by the PCAPNG format, for a total packet size of 570 bytes. Including the required padding to 4-byte boundaries, the total size of each packet in the `.pcapng` file is 604 bytes, or **2,416 bytes per event** (4 Quabos).
 
 
 ### Option 2. Enable PFF file writer
 
-PFF is a hybrid ascii/binary format described in the [PFF specification](https://github.com/panoseti/panoseti/wiki/Data-file-format). When this option is enabled the measurements from the four Quabos are aligned and combined into a single image and written in binary format to the `.pff` file. This image is prefixed by a 491-byte JSON header and a single '*' to indicate the beginning of the binary data. The total **size of each event is 2,540 bytes**.
+PFF is a hybrid ascii/binary format described in the [PFF specification](https://github.com/panoseti/panoseti/wiki/Data-file-format). When this option is enabled, the measurements from the four Quabos are aligned and combined into a single image and written in binary format to the `.pff` file. This image is prefixed by a 491-byte JSON header and a single '*' to indicate the beginning of the binary data. The total **size of each event is 2,540 bytes**.
 
 The JSON format and binary delimiter are illustrated below:
 
@@ -82,7 +84,7 @@ Any missing packets will result in the values stored in the binary and JSON bloc
 
 If `--command-port` is set to a non-zero value, the script listens for UDP commands. 
 
-Sending the 4-byte string `STOP` to the command port (no newline) will cause the script to signal a shutdown. The script responds with `STOPPING` to the sender. Upon receiving `STOP`, the main run polling loop terminates immediately. The script waits for 2 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response due to UDP packet loss).
+Sending the 4-byte string `STOP` to the command port (no newline) will cause the script to initiate a shutdown. The script responds with `STOPPING` to the sender. Upon receiving `STOP`, the main run polling loop terminates immediately. The script waits for 2 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response due to UDP packet loss).
 
 No other commands are implemented. Any other command string will result in a response of `UNKNOWN COMMAND`.
 
