@@ -35,7 +35,7 @@ This utility is designed to poll the Quabo boards with software-generated trigge
 6. **Optionally:** if writing in `.pff` format is configured: the response packets from the four Quabos are combined and written to a `.pff` file, with a size-based rollover. See below for more details.
 7. A watchdog timer reports the number of pedestal events generated and the number of packets received lost every minute.
 8. The polling loop can be terminated by a ctrl-C or TERM signal.
-9. **Optionally:** the script can listen for commands on a pre-defined UDP port (separate from the data port). It accepts a single command `STOP` in a UDP packet which terminates the polling loop. If configured, the script responds to this command with a UDP packet containing the bytes `STOPPING`. See below for more details.
+9. **Optionally:** the script can listen for commands on a pre-defined UDP port (separate from the data port). It accepts a single command `STOP` in a UDP packet which terminates the polling loop. The script responds to this command with a UDP packet containing the bytes `STOPPING`. See below for more details.
 
 ### Option 1. Enable PCAPNG file writer
 
@@ -43,7 +43,7 @@ PCAPNG is a [binary file format](https://pcapng.com/) designed for writing netwo
 
 To emulate the format of the normal on-sky-trigger events that are written by the PANOSETI DAQ, the pedestal capture code can transform the responsees received from the Quabos into the science data-packet format, as describe below, encapsulate them in *fake* UDP/IP/Ethernet/EPB headers and write them to disk as a synthetic `.pcapng` file. **Note:** this does not involve running any packet capture code such as Wireshark, the Python code simply writes the headers and data to the files itself. The code provides rollover of the `.pcapng` file at any desired time period (default 600 seconds).
 
-The raw response packets from the quabos contain a 4-byte header and 512 bytes of pixel data (256 channels of 16-bit signed integers). The script repacks this data into a 528-byte PANOSETI Science Packet:
+The raw response packets from the quabos contain a 4-byte header and 512 bytes of pixel data (256 channels of 16-bit signed integers). The script repacks this data into a 528-byte PANOSETI Science Packet with the following values:
 
 | Offset (Bytes) | Size | Field Name | Value / Description |
 | :--- | :--- | :--- | :--- |
