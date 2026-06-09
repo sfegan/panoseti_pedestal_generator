@@ -35,7 +35,7 @@ This utility is designed to poll the Quabo boards with software-generated trigge
 8. The polling loop can be terminated by a ctrl-C or TERM signal.
 9. **Optionally:** the script can listen for commands on a pre-defined UDP port (separate from the data port). It accepts a single command `STOP` in a UDP packet which terminates the polling loop. If configured, the script responds to this command with a UDP packet containing the bytes `STOPPING`.
 
-### 1. PCAPNG file writer
+### Option 1. Enable PCAPNG file writer
 
 PCAPNG is a [binary file format](https://pcapng.com/) desiged for writing network packets, and is used by by the packet-capture sofware *Wireshark*. A minimal implementation of a `.pcapng` file starts with two file-level headers, the `Section Header Block (SHB)` and the `Interface Description Block (IDB)`, followed by any number of paxket. Each packet must be prefixed by an `Enhanced Packet Block (EPB)` which contains the packet length and timestamp. The full packet is then written after the `EPB`.
 
@@ -59,9 +59,9 @@ The raw response packets from the quabos contain a 4-byte header and 512 bytes o
 This packet is enapusleted in a *UDP header* (8 bytes), an *IPv4 header* (20 bytes), an *EThernet II header* (14 bytes) and the *EPB header* (28 bytes) and *EPB footer$ (4 bytes) required by the PCAPNG format, for a total packet size of 570 bytes. Including the required padding to 4-byte boundaries, the total size of each packet in the `.pcapng` file is 604 bytes, or **2,416 bytes per event** (4 Quabos).
 
 
-### 2. PFF file writer
+### Option 2. Enable PFF file writer
 
-PFF is a hybrid ascii/binary format described in the [PFF specification](https://github.com/panoseti/panoseti/wiki/Data-file-format). The measurements from the four Quabos are aligned and combined into a single image and written in binary format to the `.pff` file. This image is prefixed by a 491-byte JSON header and a single '*' to indicate the beginning of the binary data. The total **size of each event is 2,540 bytes**.
+PFF is a hybrid ascii/binary format described in the [PFF specification](https://github.com/panoseti/panoseti/wiki/Data-file-format). When this option is enabled the measurements from the four Quabos are aligned and combined into a single image and written in binary format to the `.pff` file. This image is prefixed by a 491-byte JSON header and a single '*' to indicate the beginning of the binary data. The total **size of each event is 2,540 bytes**.
 
 The JSON format and binary delimiter are illustrated below:
 
@@ -76,7 +76,27 @@ The JSON format and binary delimiter are illustrated below:
 *
 ```
 
-Any missing packets will result in the values stored in the binary and JSON blocks being identically zero. Checking for `tv_sec==0` is a reliable way to identify such packets since this cannot occur in any other way.
+Any missing packets will result in the values stored in the binary and JSON blocks being identically zero. Checking for `tv_sec==0` is a reliable way to identify such missing packets since this cannot occur in any other way.
+
+## Option 3. Enable command port
+
+If `--command-port` is set to a non-zero value, the script listens for UDP commands. 
+
+Sending the 4-byte string `STOP` to the command port (no newline) will cause the script to signal a shutdown. The script responds with `STOPPING` to the sender. Upon receiving `STOP`, the main run polling loop terminates immediately. The script waits for 2 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response due to UDP packet loss).
+
+No other commands are implemented. Any other command string will result in a response of `UNKNOWN COMMAND`.
+
+For example, if the script is run as follows:
+
+```bash
+python3 capture_pedestal_events.py --site gattini --command-port 60013
+```
+
+Then sending a UDP packet containing `STOP` to port `60013` on the host running the script will cause it to stop generating software-trigger events, for example:
+
+```bash
+echo -n "STOP" | nc -u -w1 localhost 60013
+```
 
 ---
 
@@ -119,17 +139,6 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 | `--log-file` | | *String* | `None` | Optional file to write log messages to |
 | `--timeout` | | *Float* | `None` | UDP timeout in seconds (default: $0.5 \times \min(\text{Period}, 1.0)$) |
 | `--quabos` | | *List* | `None` | Overrides site defaults with specific `host[:port]` |
-
----
-
-## Command Port
-
-If `--command-port` is set to a non-zero value, the script listens for UDP commands. 
-
-- **STOP**: Sending the string `STOP` to the command port (no newline) will cause the script to signal a shutdown.
-- **Response**: The script responds with `STOPPING` to the sender.
-- **Termination**: Upon receiving `STOP`, the main run polling loop terminates immediately.
-- **Grace Period**: The script waits for 2 seconds after the main loop has stopped before finally closing the command port and exiting. This allows for the `STOPPING` response to be resent if the original command is repeated (e.g., if the sender didn't receive the response due to UDP packet loss).
 
 ---
 
