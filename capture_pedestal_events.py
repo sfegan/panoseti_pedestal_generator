@@ -1062,6 +1062,10 @@ class PedestalGenerator:
         clients = []
         if self.args.quabos:
             for i, q_str in enumerate(self.args.quabos):
+                if i >= 4:
+                    self.logger.warning(f"More than 4 quabos specified. Only the first 4 will be used.")
+                    break
+
                 if ':' in q_str:
                     host, port_str = q_str.rsplit(':', 1)
                     try:
