@@ -11,6 +11,7 @@
 
 import asyncio
 import os
+import sys
 import struct
 import time
 import datetime
@@ -21,6 +22,7 @@ import logging
 import array
 import abc
 import signal
+import platform
 
 class ScopeFormatter(logging.Formatter):
     """Custom formatter that ensures 'scope' always exists to avoid KeyErrors."""
@@ -342,15 +344,23 @@ class PcapngWriter(DataWriter):
 
     def _write_shb(self):
         # Section Header Block (SHB)
-        os_str = "Linux".encode('utf-8')
+        hw_str = platform.machine().encode('utf-8')
+        hw_pad = (4 - (len(hw_str) % 4)) % 4
+        os_str = f"Python {platform.python_version()} ({platform.system()})".encode('utf-8')
         os_pad = (4 - (len(os_str) % 4)) % 4
         appl_str = "PANOSETI Pedestal Capture".encode('utf-8')
         appl_pad = (4 - (len(appl_str) % 4)) % 4
         
-        # Options: shb_os (3), shb_userappl (4), opt_endofopt (0)
+        # Command line as comment
+        cmd_str = ' '.join(sys.argv).encode('utf-8')
+        cmd_pad = (4 - (len(cmd_str) % 4)) % 4
+
+        # Options: shb_hardware (2), shb_os (3), shb_userappl (4), opt_comment (1), opt_endofopt (0)
         options = (
+            struct.pack('<HH', 2, len(hw_str)) + hw_str + b'\x00' * hw_pad +
             struct.pack('<HH', 3, len(os_str)) + os_str + b'\x00' * os_pad +
             struct.pack('<HH', 4, len(appl_str)) + appl_str + b'\x00' * appl_pad +
+            struct.pack('<HH', 1, len(cmd_str)) + cmd_str + b'\x00' * cmd_pad +
             struct.pack('<HH', 0, 0)
         )
         
