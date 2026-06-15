@@ -1,8 +1,9 @@
 # PANOSETI Pedestal Generator
 
 This repository contains a tool to trigger and capture pedestal events from PANOSETI detector modules:
-- `capture_pedestal_events.py`: Polls detector boards (Quabos) for software-generated Pulse Height pedestals events, wraps the payloads in Ethernet/IP/UDP headers, and optionally writes them to disk.
-- `quabo_emulator.py`: Emulates four Quabo boards responding to SW PH trigger commands with normal-distributed random pixel values for testing.
+- `capture_pedestal_events.py`: Polls detector boards (Quabos) for software-generated Pulse Height pedestals events, wraps the payloads in Ethernet/IP/UDP headers, and optionally writes them to disk in PCAPNG, PFF, or raw binary format.
+- `quabo_emulator.py`: Emulates Quabo boards (1 to 4) responding to SW PH trigger commands with normal-distributed random pixel values for testing.
+- `dump_raw.py`: Utility to parse and display the contents of raw UDP dump files in a human-readable aligned table.
 
 Author: Stephen Fegan <sfegan@llr.in2p3.fr> (2026-05-30)
 Laboratoire Leprince-Ringuet, CNRS/IN2P3, Ecole Polytechnique, Institut Polytechnique de Paris
@@ -27,21 +28,28 @@ This utility is designed to poll the Quabo boards with software-generated trigge
 
 1. The script opens a UDP port, either with a fixed port assigned on the command line, or a randomly assigned one.
 2. It starts a phase-locked polling loop with a fixed frequency of either *N Hz* or *1/N Hz* (with *N&le;1000*).
-3. On each iteration a software trigger command is sent to all four Quabos concurrently.
+3. On each iteration a software trigger command is sent to all configured Quabos concurrently (1 to 4).
 4. The code waits a short time for the responses from the Quabos. If no writers are configured the responses are discarded. 
    * In this case the pedestal must be captured by the normal PANOSETI pactet capture system (this should be verified), from where they can be retrieved by the offline analysis chains. To aid in identifying these packets, the pedestal generater can be run at a fixed UDP port with the `--data-port` option, rather than having a random port assigned each run.
    * It is not yet clear how these packets are handled by `hashpipe` or whether they can be integrated into the usual `.pff` output files.
 5. **Optionally:** if writing in `.pcapng` format is configured: the response packet is transformed into a standard PANOSETI science packet and written to disk as a `.pcapng` file with a time-based rollover. See below for more details.
-6. **Optionally:** if writing in `.pff` format is configured: the response packets from the four Quabos are combined and written to a `.pff` file, with a size-based rollover. See below for more details.
-7. A watchdog timer reports the number of pedestal events generated and the number of packets received lost every minute.
-8. The polling loop can be terminated by a ctrl-C or TERM signal.
-9. **Optionally:** the script can listen for commands on a pre-defined UDP port (separate from the data port). It accepts a single command `STOP` in a UDP packet which terminates the polling loop. The script responds to this command with a UDP packet containing the bytes `STOPPING`. See below for more details.
+6. **Optionally:** if writing in `.pff` format is configured: the response packets from the configured Quabos are combined and written to a `.pff` file, with a size-based rollover. See below for more details.
+7. **Optionally:** if raw binary dumping is configured: the exact UDP datagrams received from the Quabos are written to a file with minimal metadata for debugging or forensic analysis. See below for more details.
+8. A watchdog timer reports the number of pedestal events generated and the number of packets received lost every minute.
+9. The polling loop can be terminated by a ctrl-C or TERM signal.
+10. **Optionally:** the script can listen for commands on a pre-defined UDP port (separate from the data port). It accepts a single command `STOP` in a UDP packet which terminates the polling loop. The script responds to this command with a UDP packet containing the bytes `STOPPING`. See below for more details.
 
 ### Option 1. Enable PCAPNG file writer
 
 PCAPNG is a [binary file format](https://pcapng.com/) designed for writing network packets, and is used by the packet-capture software *Wireshark*. A minimal implementation of a `.pcapng` file starts with two file-level headers, the `Section Header Block (SHB)` and the `Interface Description Block (IDB)`, followed by any number of packets. Each packet must be prefixed by an `Enhanced Packet Block (EPB)` which contains the packet length and timestamp. The full packet is then written after the `EPB`.
 
-To emulate the format of the normal on-sky-trigger events that are written by the PANOSETI DAQ, the pedestal capture code can transform the responsees received from the Quabos into the science data-packet format, as describe below, encapsulate them in *fake* UDP/IP/Ethernet/EPB headers and write them to disk as a synthetic `.pcapng` file. **Note:** this does not involve running any packet capture code such as Wireshark, the Python code simply writes the headers and data to the files itself. The code provides rollover of the `.pcapng` file at any desired time period (default 600 seconds).
+The `capture_pedestal_events.py` script populates the `Section Header Block (SHB)` with rich metadata for provenance:
+- **Hardware**: Records the machine architecture (e.g., `x86_64`).
+- **OS**: Records the Python version and operating system name.
+- **Comment**: Records the **full command line** used to launch the script.
+
+To emulate the format of the normal on-sky-trigger events that are written by the PANOSETI DAQ, the pedestal capture code can transform the responsees received from the Quabos into the science data-packet format, as describe below, encapsulate them in *fake* UDP/IP/Ethernet/EPB headers and write them to disk as a synthetic `.pcapng` file.
+ **Note:** this does not involve running any packet capture code such as Wireshark, the Python code simply writes the headers and data to the files itself. The code provides rollover of the `.pcapng` file at any desired time period (default 600 seconds).
 
 The raw response packets from the quabos contain a 4-byte header and 512 bytes of pixel data (256 channels of 16-bit signed integers). The script repacks this data into a 528-byte PANOSETI Science Packet with the following values:
 
@@ -100,6 +108,39 @@ Then sending a UDP packet containing `STOP` to port `60013` on the host running 
 echo -n "STOP" | nc -u -w1 localhost 60013
 ```
 
+### Option 4. Enable raw UDP dumping
+
+If the `--raw` option is enabled, the script writes the exact UDP datagrams received from the Quabos to a binary file (default `raw_responses.dat`). This is handled in a background thread to prevent disk latency from affecting the capture frequency.
+
+Each record in the raw dump file has the following binary format (Little-endian):
+- **Magic**: 8 bytes (`QUABOPED`)
+- **tv_sec**: 8-byte uint64 (Unix epoch seconds)
+- **tv_nsec**: 8-byte uint64 (Nanoseconds within the second)
+- **Host Length**: 2-byte uint16
+- **Host String**: Variable length UTF-8 (Source IP/Host)
+- **Port**: 2-byte uint16 (Source Port)
+- **Data Length**: 4-byte uint32 (Length of the UDP payload)
+- **Payload**: Variable length raw data
+
+---
+
+## Utility: dump_raw.py
+
+The `dump_raw.py` script is a helper tool to parse the binary files generated by the raw writer. It prints a human-readable aligned table of the captured packets, including the first 20 bytes of each payload interpreted as 10 unsigned 16-bit integers.
+
+**Usage:**
+```bash
+python3 dump_raw.py raw_responses.dat
+```
+
+**Example Output:**
+```
+QUABOPED 192.168.0.10    60000 1781502394 753343513   516    12     0    14     0    12     7     8     7     2     7
+QUABOPED 192.168.0.11    60000 1781502395 253475613   516    12     0    10 65534     8     9     6     6     2     6
+```
+
+---
+
 ---
 
 ## Site Configurations
@@ -108,7 +149,7 @@ Presets configure the Quabo IP addresses, DAQ IP address, and module ID:
 * For physical sites, Quabo boards are assumed to have sequential IP addresses starting from `base_ip` (Quadrant 0 to 3) on port `60000`.
 * For `localhost`, all four boards run on `127.0.0.1` using ports `60000` to `60003`.
 
-The IP addresses and ports can be overridden with the `--quabos` argument for custom setups or testing.
+The IP addresses and ports can be overridden with the `--quabos` argument for custom setups or testing. If fewer than 4 addresses are provided, only those specific quabos will be triggered and recorded (treated as the first $N$ quadrants).
 
 | Preset | Site Name | Base IP | DAQ IP | Module ID | Mode |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -140,7 +181,9 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 | `--log-level` | | *String* | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `--log-file` | | *String* | `None` | Optional file to write log messages to |
 | `--timeout` | | *Float* | `None` | UDP timeout in seconds (default: $0.5 \times \min(\text{Period}, 1.0)$) |
-| `--quabos` | | *List* | `None` | Overrides site defaults with specific `host[:port]` |
+| `--quabos` | | *List* | `None` | Overrides site defaults with specific `host[:port]` (1 to 4 allowed) |
+| `--raw` | | *Flag* | `False` | Enable raw UDP response dumping |
+| `--raw-file` | | *String* | `raw_responses.dat` | Filename for the raw UDP dump |
 
 ---
 
