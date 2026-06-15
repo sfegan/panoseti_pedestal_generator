@@ -141,8 +141,6 @@ QUABOPED 192.168.0.11    60000 1781502395 253475613   516    12     0    10 6553
 
 ---
 
----
-
 ## Site Configurations
 
 Presets configure the Quabo IP addresses, DAQ IP address, and module ID:
@@ -158,7 +156,6 @@ The IP addresses and ports can be overridden with the `--quabos` argument for cu
 | `fern` | Fern | `192.168.3.240` | `192.168.0.9` | `252` | Sequential IPs |
 | `pti` | PTI | `192.168.3.232` | `192.168.0.8` | `250` | Sequential IPs |
 | `localhost` | Emulator | `127.0.0.1` | `127.0.0.1` | `0` | Sequential Ports |
-
 
 ---
 
