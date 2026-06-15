@@ -819,6 +819,117 @@ class PffWriter(DataWriter):
 
 ###################################################################################################
 #
+#    8888888b.         d8888 888       888 
+#    888   Y88b       d88888 888   o   888 
+#    888    888      d88P888 888  d8b  888 
+#    888   d88P     d88P 888 888 d888b 888 
+#    8888888P"     d88P  888 888d88888b888 
+#    888 T88b     d88P   888 88888P Y88888 
+#    888  T88b   d8888888888 8888P   Y8888 
+#    888   T88b d88P     888 888P     Y888 
+#
+###################################################################################################
+
+class RawWriter(DataWriter):
+    """
+    Writer for raw UDP responses with background I/O.
+    """
+    @property
+    def name(self) -> str:
+        return "RAW"
+
+    def __init__(self, filename: str, site_info: dict, logger) -> None:
+        self.filename = filename
+        self.site_info = site_info
+        self.logger = logging.LoggerAdapter(logger, {'scope': site_info['scope']})
+
+        # Internal state
+        self.raw_handle = None
+        self.packets_written = 0
+
+        # Background I/O
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.write_queue = asyncio.Queue()
+        self.writer_task = None
+
+    def start(self, loop):
+        self.logger.info(f"[RAW] Starting writer: file=\"{self.filename}\"")
+        self.raw_handle = open(self.filename, 'wb')
+        self.logger.info(f"[RAW] Opened {self.filename}")
+        self.writer_task = loop.create_task(self._disk_writer())
+
+    async def _disk_writer(self):
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                item = await self.write_queue.get()
+                if item is None: # Shutdown sentinel
+                    break
+                
+                try:
+                    await loop.run_in_executor(self.executor, self._write_raw_sync, item)
+                    self.packets_written += 1
+                except Exception as e:
+                    self.logger.error(f"[RAW] Disk writer error: {e}")
+                finally:
+                    self.write_queue.task_done()
+        finally:
+            if self.raw_handle:
+                self.logger.info(f"[RAW] Closing {self.filename}, {self.packets_written} packets written.")
+                self.raw_handle.close()
+                self.raw_handle = None
+            if self.write_queue:
+                try:
+                    self.write_queue.task_done()
+                except ValueError:
+                    pass
+
+    def _write_raw_sync(self, item):
+        ts_ns, addr, data = item
+        host, port = addr
+        host_bytes = host.encode('utf-8')
+        # Format: [uint64 magic] [uint64 tv_sec] [uint64 tv_nsec] [uint16 host_len] [host_bytes] [uint16 port] [uint32 data_len] [data]
+        # Magic: 0x4445504f42415551 = "QUABOPED"
+        tv_sec = ts_ns // 1_000_000_000
+        tv_nsec = ts_ns % 1_000_000_000
+        header = struct.pack('<QQQH', 0x4445504f42415551, tv_sec, tv_nsec, len(host_bytes))
+        footer = struct.pack('<HI', port, len(data))
+        self.raw_handle.write(header + host_bytes + footer + data)
+        self.raw_handle.flush()
+
+    def record_datagram(self, data, addr):
+        """Called from protocol level to record every received packet."""
+        ts_ns = time.time_ns()
+        try:
+            self.write_queue.put_nowait((ts_ns, addr, data))
+        except (asyncio.QueueFull, AttributeError):
+            pass
+
+    def write_packet(self, q, pixel_data, ts_tai, nanosec, ts_utc, cycle_count) -> None:
+        """No-op for DataWriter interface as record_datagram handles the work."""
+        pass
+
+    def read_and_reset_dropped_packet_count(self) -> int:
+        return 0
+
+    def close(self) -> None:
+        try:
+            self.write_queue.put_nowait(None)
+        except (RuntimeError, asyncio.QueueFull):
+            pass
+
+    async def join(self) -> None:
+        if self.writer_task:
+            try:
+                await asyncio.wait_for(self.writer_task, timeout=5.0)
+            except (asyncio.TimeoutError, RuntimeError, asyncio.CancelledError):
+                pass
+            finally:
+                if self.executor:
+                    self.executor.shutdown(wait=True)
+
+###################################################################################################
+#
 #     .d88888b.                    888               
 #    d88P" "Y88b                   888               
 #    888     888                   888               
@@ -833,16 +944,20 @@ class PffWriter(DataWriter):
 
 class QuaboManager(asyncio.DatagramProtocol):
     """Manages a single persistent UDP socket for all quabos."""
-    def __init__(self):
+    def __init__(self, raw_writer=None):
         self.transport = None
         self.pending_requests = {}  # (ip, port) -> Future
         self._sock_fd = None  # raw socket file descriptor (for drain operations)
+        self.raw_writer = raw_writer
 
     def connection_made(self, transport):
         self.transport = transport
         self._sock_fd = transport.get_extra_info('socket').fileno()
 
     def datagram_received(self, data, addr):
+        if self.raw_writer:
+            self.raw_writer.record_datagram(data, addr)
+
         future = self.pending_requests.pop(addr, None)
         if future and not future.done():
             future.set_result(data)
@@ -1050,6 +1165,15 @@ class PedestalGenerator:
                 logger=self.logger
             ))
         
+        self.raw_writer = None
+        if args.raw:
+            self.raw_writer = RawWriter(
+                filename=args.raw_file,
+                site_info=self.site_info,
+                logger=self.logger
+            )
+            self.writers.append(self.raw_writer)
+
         self._watchdog_task = None
 
         # Calculate effective polling period and trigger offset (phase)
@@ -1163,7 +1287,7 @@ class PedestalGenerator:
         loop = asyncio.get_running_loop()
         # Initialize the single shared socket
         self.transport, self.manager = await loop.create_datagram_endpoint(
-            lambda: QuaboManager(),
+            lambda: QuaboManager(raw_writer=self.raw_writer),
             local_addr=('0.0.0.0', self.args.data_port)
         )
 
@@ -1419,6 +1543,8 @@ async def main():
     # Esoteric options
     parser.add_argument('--tai-offset', type=int, default=37, help='TAI offset from UTC')
     parser.add_argument('--test-card', action='store_true', help='Replace all quabo data with a fixed test pattern (for testing PCAP/PFF output alignment)')
+    parser.add_argument('--raw', action='store_true', help='Dump raw UDP responses to disk')
+    parser.add_argument('--raw-file', default='raw_responses.dat', help='Filename for raw UDP dump')
 
     args = parser.parse_args()
 
