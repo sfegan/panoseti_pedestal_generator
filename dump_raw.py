@@ -52,6 +52,11 @@ def dump_raw(filename):
                 
     except FileNotFoundError:
         print(f"Error: File '{filename}' not found.", file=sys.stderr)
+    except BrokenPipeError:
+        # Standard behavior for piping to 'head': exit silently
+        sys.stdout.flush()
+        sys.stderr.close()
+        sys.exit(0)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
 
